@@ -1,0 +1,10 @@
+# Personal Assistant Environment Variables
+# Copy this file to .env and fill in your API keys
+
+# OpenAI API Key (required for GPT functionality)
+# Get your API key from: https://platform.openai.com/api-keys
+OPENAI_API_KEY=your_openai_api_key_here
+
+# OpenWeather API Key (required for weather functionality)
+# Get your API key from: https://openweathermap.org/api
+OPENWEATHER_API_KEY=your_openweather_api_key_here

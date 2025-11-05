@@ -1,0 +1,9 @@
+python-dotenv
+openai
+requests
+autopep8
+playsound==1.2.2
+SpeechRecognition==3.10.0
+PyAudio; platform_system == "Windows"
+pyttsx3==2.90
+setuptools

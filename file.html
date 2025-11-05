@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bittu – Assistant Visualization</title>
+    <link rel="stylesheet" href="file.css">
+</head>
+<body class="bittu-body">
+    <div class="container bittu-container">
+        <header class="bittu-header">
+            <div class="bittu-title">Bittu – Personal AI Assistant</div>
+            <div class="bittu-status">
+                <span class="dot" id="dot-listening" title="Listening"></span>
+                <span class="label">Listening</span>
+                <span class="dot" id="dot-processing" title="Processing"></span>
+                <span class="label">Processing</span>
+                <span class="dot" id="dot-speaking" title="Speaking"></span>
+                <span class="label">Speaking</span>
+            </div>
+        </header>
+
+        <main class="grid">
+            <section class="bittu-brain-card glass card-xl">
+                <canvas id="brainCanvas" width="900" height="520"></canvas>
+                <div id="statusBar" class="status-bar">Status: Idle</div>
+            </section>
+
+            <aside class="side card glass">
+                <div class="panel">
+                    <div class="panel-title">Quick States</div>
+                    <div class="bittu-controls">
+                        <button class="btn btn-secondary" onclick="BittuUI.setIdle()">Idle</button>
+                        <button class="btn btn-green" onclick="BittuUI.setListening()">Listening</button>
+                        <button class="btn btn-blue" onclick="BittuUI.setProcessing()">Processing</button>
+                        <button class="btn btn-orange" onclick="BittuUI.setSpeaking()">Speaking</button>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-title">Interaction Log</div>
+                    <div id="log" class="log-body"></div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-title">Send Command</div>
+                    <div class="cmd-row">
+                        <input id="cmdInput" class="cmd-input" placeholder="Type a command (or say 'Bittu ...') and press Enter">
+                        <button class="btn btn-green" id="sendBtn">Send</button>
+                    </div>
+                    <div id="cmdHint" class="hint">Tip: try "open youtube" or "run dir"</div>
+                </div>
+            </aside>
+        </main>
+    </div>
+
+    <script src="file.js"></script>
+</body>
+</html>
