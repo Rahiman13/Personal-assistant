@@ -4,10 +4,45 @@ import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import List
 try:
-    # Import lazily to avoid hard failures if core isn't ready at import time
-    from core.brain import process_command as _process_command
+    # For printing to terminal similarly to CLI flow
+    from interface.cli_interface import show_output as _show_output, show_error as _show_error, show_success as _show_success
 except Exception:
-    _process_command = None  # Fallback; handler will guard
+    def _show_output(msg: str) -> None:
+        try:
+            print("\n" + "="*60)
+            print("🤖 Assistant:")
+            print("-" * 20)
+            print(f"   {msg}")
+            print("="*60)
+        except Exception:
+            pass
+    def _show_error(msg: str) -> None:
+        try:
+            print("\n❌" + "="*58)
+            print("🚨 ERROR:")
+            print("-" * 10)
+            print(f"   {msg}")
+            print("❌" + "="*58)
+        except Exception:
+            pass
+    def _show_success(msg: str) -> None:
+        try:
+            print("\n✅" + "="*58)
+            print("🎉 SUCCESS:")
+            print("-" * 10)
+            print(f"   {msg}")
+            print("✅" + "="*58)
+        except Exception:
+            pass
+try:
+    # Import lazily to avoid hard failures if core isn't ready at import time
+    from core.brain import process_command_with_learning as _process_command
+except Exception:
+    try:
+        # Fallback to regular process_command if learning not available
+        from core.brain import process_command as _process_command
+    except Exception:
+        _process_command = None  # Fallback; handler will guard
 
 _clients_lock = threading.Lock()
 _clients: List["SSEHandler"] = []
@@ -137,6 +172,12 @@ class SSEHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b"{\"error\": \"Missing text\"}")
                 return
 
+            # Echo user's web command to terminal for parity with CLI
+            try:
+                print(f"🧑 You (web): {text}")
+            except Exception:
+                pass
+
             # Emit UI events around processing
             try:
                 emit_heard(text)
@@ -148,15 +189,33 @@ class SSEHandler(BaseHTTPRequestHandler):
             response_text = ""
             try:
                 if _process_command is None:
-                    raise RuntimeError("process_command not available")
-                response_text = _process_command(text)
+                    response_text = "⚠️ Command processor not available. Please restart the application."
+                else:
+                    response_text = _process_command(text)
+                    # Ensure we always have a response
+                    if not response_text or not response_text.strip():
+                        response_text = "Command processed successfully."
             except Exception as e:
-                response_text = f"❌ Error: {e}"
+                response_text = f"❌ Error: {str(e)}"
+                import traceback
+                traceback.print_exc()
 
             # Speak event for UI and finish with listening
             try:
                 emit_speaking(response_text)
                 emit_listening()
+            except Exception:
+                pass
+
+            # Print structured response to terminal similar to CLI
+            try:
+                lower = (response_text or "").lower()
+                if ("✅" in response_text) or ("success" in lower):
+                    _show_success(response_text)
+                elif ("❌" in response_text) or ("error" in lower):
+                    _show_error(response_text)
+                else:
+                    _show_output(response_text)
             except Exception:
                 pass
 

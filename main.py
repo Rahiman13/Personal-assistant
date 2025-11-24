@@ -1,12 +1,23 @@
 # main.py
+import os
+import time
+import threading
+
 from interface.cli_interface import (
     get_input, show_output, show_welcome, show_goodbye, 
     show_help_menu, show_error, show_success
 )
-from core.brain import process_command
+# Import with fallback to ensure it always works
+try:
+    from core.brain import process_command_with_learning as process_command
+except Exception:
+    # Fallback if learning system fails
+    from core.brain import process_command
+    print("⚠️ Using basic command processor (learning disabled)")
 from skills.system_controls import is_alarm_active, stop_alarm_now
 from voice import VoiceAssistant
 from interface import web_server
+from knowledge.llm_connector import get_last_llm_label
 
 def main():
     """Main function to run the Personal AI Assistant"""
@@ -15,12 +26,152 @@ def main():
         show_welcome()
         
         # Voice assistant state - auto-start enabled
-        # Create a temporary callback that will be replaced
-        def temp_callback(text: str):
-            print(f"⚠️ Temporary callback called with: '{text}' - this should not happen")
-        
-        voice_engine = VoiceAssistant(temp_callback)
         voice_enabled = False
+        # Pending multi-turn intent (e.g., waiting for a YouTube song after asking)
+        pending_youtube_song: bool = False
+        # Pending command after wake word (user said "Bittu" and paused)
+        pending_wake_command: bool = False
+        pending_command_buffer: str = ""
+
+        voice_wake_ack_enabled = os.getenv("VOICE_WAKE_ACK", "1") != "0"
+        voice_wake_prompt = os.getenv("VOICE_WAKE_PROMPT", "Yes, I'm listening.")
+        voice_wake_repeat_prompt = os.getenv(
+            "VOICE_WAKE_REPEAT_PROMPT",
+            "I didn't catch that. Please tell me your request."
+        )
+        pending_wake_timeout = float(os.getenv("VOICE_PENDING_TIMEOUT", "4.0"))
+        pending_wake_started_at: float | None = None
+        pending_wake_prompted = False
+        voice_tts_enabled = os.getenv("VOICE_TTS_ENABLED", "1") != "0"
+        voice_spoken_greeting_enabled = os.getenv("VOICE_SPOKEN_GREETING", "0") != "0"
+        voice_greeting_text = os.getenv("VOICE_GREETING_TEXT", "Bittu is listening.")
+        current_voice_task = {"thread": None, "cancel": None}
+        current_voice_task_lock = threading.Lock()
+        command_queue: list[str] = []
+        command_queue_lock = threading.Lock()
+
+        def _force_speak(text: str) -> None:
+            if not voice_engine or not hasattr(voice_engine, "speak"):
+                return
+            if not text or not text.strip():
+                return
+            try:
+                voice_engine.speak(text)
+            except Exception:
+                pass
+
+        def speak_if_allowed(text: str) -> None:
+            if not voice_tts_enabled:
+                return
+            _force_speak(text)
+
+        def _is_voice_task_running() -> bool:
+            with current_voice_task_lock:
+                thread = current_voice_task.get("thread")
+            return bool(thread and thread.is_alive())
+
+        def _cancel_active_voice_task(reason: str = "") -> None:
+            nonlocal pending_youtube_song, pending_command_buffer, pending_wake_command
+            cancel = None
+            with current_voice_task_lock:
+                cancel = current_voice_task.get("cancel")
+            if cancel and not cancel.is_set():
+                cancel.set()
+            pending_youtube_song = False
+            pending_command_buffer = ""
+            pending_wake_command = False
+            if voice_engine and hasattr(voice_engine, "stop_speaking"):
+                voice_engine.stop_speaking()
+            if reason:
+                print(reason)
+
+        def _maybe_run_next_queued_command() -> None:
+            next_command = None
+            with command_queue_lock:
+                if command_queue:
+                    next_command = command_queue.pop(0)
+            if next_command:
+                print(f"▶️ Running queued command: '{next_command}'")
+                _start_voice_task(next_command)
+
+        def _start_voice_task(command: str) -> None:
+            nonlocal pending_youtube_song, pending_command_buffer, voice_enabled
+            print(f"🚀 _start_voice_task called with: '{command}'")
+            cancel_event = threading.Event()
+
+            def worker() -> None:
+                nonlocal pending_youtube_song, pending_command_buffer, voice_enabled
+                start_time = time.time()
+                try:
+                    try:
+                        web_server.emit_processing()
+                    except Exception:
+                        pass
+                    print("⏳ Working on your request...")
+                    def delayed_hint():
+                        if not cancel_event.is_set():
+                            speak_if_allowed("Working on it.")
+                    hint_timer = threading.Timer(1.0, delayed_hint)
+                    hint_timer.start()
+                    try:
+                        print(f"🔄 Calling process_command('{command}')...")
+                        resp = process_command(command)
+                        elapsed = time.time() - start_time
+                        print(f"⏱️ process_command completed in {elapsed:.2f}s")
+                    except Exception as e:
+                        elapsed = time.time() - start_time
+                        print(f"❌ process_command failed after {elapsed:.2f}s: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        resp = f"❌ Error processing command: {str(e)}"
+                    finally:
+                        hint_timer.cancel()
+                    if cancel_event.is_set():
+                        print(f"⛔ Command '{command}' cancelled before completion.")
+                        announce_ready(command, "")
+                        return
+                    if not resp:
+                        resp = "I'm not sure how to respond to that. Could you please rephrase your question?"
+                    print_response(resp)
+                    if isinstance(resp, str) and resp.strip().lower().startswith("which song should i play on youtube"):
+                        pending_youtube_song = True
+                        speak_if_allowed("Which song should I play on YouTube?")
+                    voice_response = create_voice_response(resp, command)
+                    if voice_response and voice_response.strip():
+                        try:
+                            web_server.emit_speaking(voice_response)
+                        except Exception:
+                            pass
+                        speak_if_allowed(voice_response)
+                    pending_command_buffer = ""
+                    announce_ready(command, resp)
+                    total_elapsed = time.time() - start_time
+                    print(f"✅ Command completed in {total_elapsed:.2f}s. 🎤 Listening for 'bittu'...")
+                    if voice_enabled and voice_engine and not voice_engine.is_running():
+                        print("⚠️ Voice assistant stopped! Restarting...")
+                        if voice_engine.restart():
+                            print("✅ Voice assistant restarted")
+                        else:
+                            print("❌ Failed to restart voice assistant")
+                            voice_enabled = False
+                except Exception as worker_err:
+                    print(f"❌ CRITICAL ERROR in worker thread: {worker_err}")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    cancel_event.set()
+                    with current_voice_task_lock:
+                        if current_voice_task.get("cancel") is cancel_event:
+                            current_voice_task["thread"] = None
+                            current_voice_task["cancel"] = None
+                    _maybe_run_next_queued_command()
+
+            thread = threading.Thread(target=worker, daemon=True)
+            with current_voice_task_lock:
+                current_voice_task["thread"] = thread
+                current_voice_task["cancel"] = cancel_event
+            thread.start()
+            print(f"✅ Worker thread started for command: '{command}'")
         
         # Start lightweight SSE server for web brain
         try:
@@ -37,26 +188,6 @@ def main():
                 _wb.open_new_tab(ui_path.as_uri())
         except Exception:
             pass
-
-        # Auto-start voice assistant
-        show_output("🎙️ Initializing voice assistant...")
-        try:
-            if voice_engine.start():
-                voice_enabled = True
-                show_success("🎙️ Voice assistant ready!")
-                # Personalized greeting
-                greeting = "Hi, this is Bittu. I'm listening. Say 'Bittu' followed by your command."
-                show_output(greeting)
-                show_output("🎤 Voice assistant is listening continuously. Say 'Bittu' followed by your command.")
-                # Speak greeting in background (non-blocking)
-                voice_engine.speak(greeting)
-            else:
-                show_error("❌ Voice assistant failed to start. You can still use text commands.")
-                diag = getattr(voice_engine, 'diagnostics', lambda: 'No diagnostics')()
-                show_output("Voice diagnostics: " + diag)
-        except Exception as e:
-            show_error(f"❌ Voice assistant initialization failed: {str(e)}")
-            show_output("You can still use text commands. Type 'help' for assistance.")
 
         def tts_clean(s: str) -> str:
             # Keep a short, readable spoken summary (strip emojis and excessive whitespace)
@@ -79,17 +210,25 @@ def main():
             return s
 
         def has_wake_word(s: str) -> bool:
+            """Enhanced wake word detection with confidence scoring (Siri/Alexa-like)"""
             text = normalize_text(s)
-            # More accurate wake word detection - check if "bittu" appears as a word
-            # Common variants and greetings
-            wake_variants = {
-                "bittu", "bitu", "bitto", "beetu", "bithu", "bito",
-                "bittu ji", "bittuji", "hey bittu", "hi bittu", "ok bittu", "okay bittu"
+            
+            # Exact matches (highest confidence)
+            exact_wake_words = {
+                "bittu", "bitu", "bitto", "beetu", "bithu", "bito"
             }
-            # Check for exact matches in variants
+            if any(w == text or text.startswith(w + " ") for w in exact_wake_words):
+                return True
+            
+            # Common variants and greetings (high confidence)
+            wake_variants = {
+                "bittu ji", "bittuji", "hey bittu", "hi bittu", "ok bittu", "okay bittu",
+                "bittu please", "please bittu", "bittu can you", "bittu could you"
+            }
             if any(w in text for w in wake_variants):
                 return True
-            # Regex-based fuzzy match (captures common STT confusions)
+            
+            # Regex-based fuzzy match (captures common STT confusions) - medium confidence
             try:
                 import re
                 patterns = [
@@ -99,17 +238,39 @@ def main():
                     r"\bbit+o\b",          # bitto
                     r"^bittu\b",           # Start with bittu
                     r"\bbittu\s",          # bittu followed by space
+                    r"\bb[iy]t+[ou]+\b",  # Additional variations
                 ]
                 for p in patterns:
                     if re.search(p, text):
                         return True
             except Exception:
                 pass
-            # Token match - check if bittu is a separate word
+            
+            # Token match - check if bittu is a separate word (lower confidence but still valid)
             tokens = text.split()
-            return "bittu" in tokens or any(t.startswith("bitt") for t in tokens)
+            if "bittu" in tokens:
+                return True
+
+            # Misheard variants that frequently appear in STT results (e.g., "vitamin")
+            misheard_variants = {
+                "vitamin", "bitten", "bitton", "button", "beetle", "beetle",
+                "bitten,", "bit two", "bit too", "b2", "b two", "be too",
+                "b to", "beta", "beetoo"
+            }
+            for token in tokens:
+                if token in misheard_variants:
+                    return True
+            if any(text.startswith(variant + " ") for variant in misheard_variants):
+                return True
+            
+            # Partial match - check if any token starts with "bitt" (lowest confidence)
+            if any(t.startswith("bitt") and len(t) <= 6 for t in tokens):
+                return True
+            
+            return False
 
         def strip_wake_word(s: str) -> str:
+            """Remove wake word and clean up duplicated/malformed text."""
             text = normalize_text(s)
             try:
                 import re
@@ -133,68 +294,211 @@ def main():
                 for w in ["hey", "hi", "ok", "please"]:
                     text = text.replace(f"{w} bittu", "bittu").strip()
                 text = text.replace("bittu", "").strip()
-            return text
+
+            # Remove known misheard variants as wake words
+            misheard_variants = [
+                "vitamin", "bitten", "bitton", "button", "beetle", "bit two",
+                "bit too", "b two", "b2", "beta", "beetoo", "be too", "b to"
+            ]
+            for variant in misheard_variants:
+                text = text.replace(variant, " ").strip()
+            try:
+                import re as _re
+                text = _re.sub(r"\s+", " ", text).strip()
+            except Exception:
+                text = " ".join(text.split())
+            
+            # Remove duplicate phrases (e.g., "open Notepad Bittu open Notepad" -> "open Notepad")
+            # After removing wake word, we might have "open notepad open notepad"
+            words = text.split()
+            if len(words) >= 2:
+                # Simple and effective: remove consecutive duplicate 2-word phrases
+                cleaned_words = []
+                i = 0
+                while i < len(words):
+                    # Check if we have a duplicate 2-word phrase starting at i
+                    if i + 3 < len(words):  # Need at least 4 words: "a b a b"
+                        if words[i] == words[i+2] and words[i+1] == words[i+3]:
+                            # Found duplicate 2-word phrase, keep only first occurrence
+                            cleaned_words.append(words[i])
+                            cleaned_words.append(words[i+1])
+                            i += 4  # Skip all 4 words
+                            continue
+                    # Check for duplicate single word (less common but possible)
+                    if i + 1 < len(words) and words[i] == words[i+1]:
+                        cleaned_words.append(words[i])
+                        i += 2  # Skip duplicate
+                        continue
+                    # No duplicate, keep the word
+                    cleaned_words.append(words[i])
+                    i += 1
+                if cleaned_words:
+                    text = " ".join(cleaned_words)
+            
+            return text.strip()
+        
+        def normalize_command_typos(command: str) -> str:
+            """Normalize common typos and variations in commands without over-replacing."""
+            if not command:
+                return command
+            
+            cmd_lower = command.lower().strip()
+            
+            # Common typo corrections (only apply when the typo is a standalone word)
+            typo_map = {
+                "utube": "youtube",
+                "u tube": "youtube",
+                "you tube": "youtube",
+                "yt": "youtube",
+                "fb": "facebook",
+                "gmail": "gmail",
+                "google": "google",
+                "github": "github",
+                "calc": "calculator",
+                "notepad": "notepad",
+                "code": "vs code",
+                "vscode": "vs code",
+                "vs code": "vs code",
+            }
+            
+            try:
+                import re as _re
+            except Exception:
+                _re = None
+            
+            for typo, correct in typo_map.items():
+                if typo not in cmd_lower:
+                    continue
+                if _re:
+                    pattern = r"\b" + _re.escape(typo) + r"\b"
+                    if _re.search(pattern, cmd_lower):
+                        command = _re.sub(pattern, correct, command, count=1, flags=_re.IGNORECASE)
+                        break
+                else:
+                    tokens = command.split()
+                    new_tokens = []
+                    replaced = False
+                    for token in tokens:
+                        if not replaced and token.lower() == typo:
+                            new_tokens.append(correct)
+                            replaced = True
+                        else:
+                            new_tokens.append(token)
+                    command = " ".join(new_tokens)
+                    if replaced:
+                        break
+            
+            return command
         
         def create_voice_response(full_response: str, command: str) -> str:
-            """Create shorter, more natural voice responses"""
-            command_lower = command.lower().strip()
-            
-            # Handle specific commands with short responses
+            """Create very short, concise voice responses (max 80 characters)."""
+            if not full_response or not full_response.strip():
+                return "Done."
+            command_lower = (command or "").lower().strip()
+
+            # Handle specific commands with deterministic responses
             if "open youtube" in command_lower or "youtube" in command_lower:
-                return "Opening YouTube"
-            elif "open google" in command_lower or "google" in command_lower:
-                return "Opening Google"
-            elif "open gmail" in command_lower or "gmail" in command_lower:
-                return "Opening Gmail"
-            elif "open github" in command_lower or "github" in command_lower:
-                return "Opening GitHub"
-            elif "open calculator" in command_lower or "calculator" in command_lower:
-                return "Opening Calculator"
-            elif "open notepad" in command_lower or "notepad" in command_lower:
-                return "Opening Notepad"
-            elif "open vs code" in command_lower or "code" in command_lower:
-                return "Opening VS Code"
-            elif "weather" in command_lower:
-                # Extract just the weather info, not the full response
-                if "temperature" in full_response.lower():
-                    import re
-                    temp_match = re.search(r'(\d+[°°]?[CF]?)', full_response)
-                    if temp_match:
-                        return f"Weather: {temp_match.group(1)}"
-                return "Getting weather information"
-            elif "create" in command_lower and ("file" in command_lower or "script" in command_lower):
+                return "Opening YouTube."
+            if "open google" in command_lower or "google" in command_lower:
+                return "Opening Google."
+            if "open gmail" in command_lower or "gmail" in command_lower:
+                return "Opening Gmail."
+            if "open github" in command_lower or "github" in command_lower:
+                return "Opening GitHub."
+            if "open calculator" in command_lower or "calculator" in command_lower:
+                return "Opening Calculator."
+            if "open notepad" in command_lower or "notepad" in command_lower:
+                return "Opening Notepad."
+            if "open vs code" in command_lower or "code" in command_lower:
+                return "Opening VS Code."
+            if "weather" in command_lower:
+                import re
+                temp_match = re.search(r"(\d+[°°]?[CF]?)", full_response)
+                if temp_match:
+                    return f"Temperature is {temp_match.group(1)}."
+                return "Weather information retrieved."
+            if "create" in command_lower and ("file" in command_lower or "script" in command_lower):
                 if "python" in command_lower:
-                    return "Creating Python script"
-                elif "html" in command_lower:
-                    return "Creating HTML file"
-                elif "css" in command_lower:
-                    return "Creating CSS file"
-                elif "javascript" in command_lower or "js" in command_lower:
-                    return "Creating JavaScript file"
-                else:
-                    return "Creating file"
-            elif "remind" in command_lower or "reminder" in command_lower:
-                return "Reminder set"
-            elif "help" in command_lower:
-                return "Here are the available commands"
-            elif "hello" in command_lower or "hi" in command_lower:
-                return "Hello! How can I help you?"
-            elif "thank" in command_lower:
+                    return "Python file created."
+                if "html" in command_lower:
+                    return "HTML file created."
+                if "css" in command_lower:
+                    return "CSS file created."
+                if "javascript" in command_lower or "js" in command_lower:
+                    return "JavaScript file created."
+                return "File created."
+            if "remind" in command_lower or "reminder" in command_lower:
+                return "Reminder set."
+            if "help" in command_lower:
+                return "Check the terminal for available commands."
+            if "hello" in command_lower or "hi" in command_lower:
+                return "Hello! How can I help?"
+            if "thank" in command_lower:
                 return "You're welcome!"
-            elif "bye" in command_lower or "goodbye" in command_lower:
-                return "Goodbye! Have a great day!"
-            else:
-                # For other commands, use a shortened version
-                if len(full_response) > 100:
-                    # Try to extract the key information
-                    if "✅" in full_response:
-                        return "Done!"
-                    elif "❌" in full_response:
-                        return "Sorry, I couldn't do that"
-                    else:
-                        return "Command completed"
-                else:
-                    return tts_clean(full_response)
+            if "bye" in command_lower or "goodbye" in command_lower:
+                return "Goodbye!"
+            if "time" in command_lower:
+                import re
+                time_match = re.search(r"(\d{1,2}:\d{2}(?:\s*[AP]M)?)", full_response, re.IGNORECASE)
+                if time_match:
+                    return f"The time is {time_match.group(1)}."
+                return "Time retrieved."
+            if "date" in command_lower:
+                return "Date retrieved."
+            if "search" in command_lower:
+                return "Searching."
+            if "play" in command_lower:
+                return "Playing."
+
+            cleaned = tts_clean(full_response)
+            if "✅" in full_response or "success" in cleaned.lower():
+                return "Done."
+            if "❌" in full_response or "error" in cleaned.lower() or "failed" in cleaned.lower():
+                return "Sorry, couldn't do that."
+
+            import re
+            sentences = [s.strip() for s in re.split(r"[.!?]\s+", cleaned) if s.strip()]
+            if sentences:
+                first_sentence = sentences[0]
+                if len(first_sentence) <= 50:
+                    return first_sentence + "."
+                truncated = first_sentence[:47]
+                last_space = truncated.rfind(" ")
+                if last_space > 25:
+                    truncated = truncated[:last_space]
+                return truncated + "..."
+
+            return "Done."
+
+        def command_needs_followup(command: str) -> bool:
+            """Heuristic to detect when user hasn't finished the command."""
+            if not command:
+                return True
+            lower = command.lower().strip()
+            incomplete_endings = (
+                " for", " to", " about", " regarding", " on", " with",
+                " into", " inside", " over", " under", " by", " of"
+            )
+            if any(lower.endswith(end) for end in incomplete_endings):
+                return True
+            short_commands = {
+                "write", "create", "make", "open", "generate", "code",
+                "build", "explain", "search", "find"
+            }
+            if lower in short_commands:
+                return True
+            short_two_word_patterns = (
+                "write a", "write the", "create a", "create the",
+                "make a", "make the", "open a", "open the",
+                "generate a", "generate the", "code a", "code the",
+                "search for", "find a", "find the"
+            )
+            if any(
+                lower.startswith(pattern) and len(lower.split()) <= len(pattern.split()) + 1
+                for pattern in short_two_word_patterns
+            ):
+                return True
+            return False
 
         def announce_ready(command_or_text: str, full_response: str | None = None) -> None:
             """After completing a command, set state/UI to indicate ready for next command.
@@ -211,87 +515,262 @@ def main():
                 pass
             _emit_log("Status: listening for wake word 'bittu'")
 
+        # Create voice_engine variable placeholder (will be set before use)
+        voice_engine = None
+        
         def on_voice_text(text: str) -> None:
             nonlocal voice_enabled
+            nonlocal pending_youtube_song
+            nonlocal pending_wake_command
+            nonlocal pending_command_buffer
+            nonlocal voice_engine
+            nonlocal pending_wake_started_at
+            nonlocal pending_wake_prompted
+            nonlocal voice_tts_enabled
             """Handle voice input - simplified Alexa-like behavior: always listen for wake word."""
+            # Reduced logging for faster processing
+            print(f"\n🎤 Voice input: '{text}'")
             try:
                 if not text or not text.strip():
+                    print("⚠️ Empty text received, ignoring...")
                     return
+                if not voice_engine:
+                    print("❌ ERROR: voice_engine is None!")
+                    return
+
+                normalized_text = normalize_text(text)
+
+                if normalized_text in {"mute responses", "mute response", "bittu mute responses", "silent mode"}:
+                    if voice_tts_enabled:
+                        _force_speak("Okay, I'll stay quiet.")
+                    voice_tts_enabled = False
+                    print("🔇 Voice responses muted.")
+                    return
+                if normalized_text in {"unmute responses", "voice on", "bittu speak", "enable responses"}:
+                    voice_tts_enabled = True
+                    _force_speak("Voice responses are back on.")
+                    print("🔊 Voice responses re-enabled.")
+                    return
+
+                if pending_wake_command and pending_wake_started_at and pending_wake_timeout > 0:
+                    elapsed = time.time() - pending_wake_started_at
+                    if elapsed >= pending_wake_timeout and not pending_wake_prompted:
+                        pending_wake_prompted = True
+                        print("⌛ Wake word heard but no command yet. Prompting user...")
+                        if voice_wake_ack_enabled:
+                            try:
+                                speak_if_allowed(voice_wake_repeat_prompt)
+                            except Exception:
+                                pass
+                        pending_wake_started_at = time.time()
                     
-                print(f"\n🎤 Heard: '{text}'")
+                print(f"🎤 Processing voice input: '{text}'")
                 try:
                     web_server.emit_heard(text)
                 except Exception:
                     pass
                 
-                # Determine if wake word is present in the utterance
-                wake_present = has_wake_word(text)
-                print(f"🔍 Wake word detected: {wake_present}")
-                
-                # Only process if wake word is detected (Alexa-like behavior)
-                if wake_present:
-                    # Remove wake word and get the command
-                    command = strip_wake_word(text)
-                    print(f"📝 Extracted command: '{command}'")
-                    
-                    if command and command.strip():
-                        # We have a command with wake word - process it
-                        print(f"🎯 Processing command: '{command}'")
+                # Handle follow-up for pending YouTube song selection
+                if pending_youtube_song:
+                    song_query = text.strip()
+                    if not song_query:
+                        return
+                    cmd = f"open youtube play {song_query}"
+                    print(f"🎯 Processing follow-up YouTube song: '{song_query}'")
+                    pending_youtube_song = False
+                    speak_if_allowed(f"Searching YouTube for {song_query}")
+                    _start_voice_task(cmd)
+                    return
+
+                # Enhanced wake word detection with confidence (Siri/Alexa-like accuracy)
+                print(f"🔍 Step 1: Checking wake word in text: '{text}'")
+                if pending_wake_command:
+                    wake_present = True
+                    wake_confidence = "pending"
+                    print("🔔 Wake word pending - expecting command without repeating 'Bittu'.")
+                    pending_wake_command = False
+                else:
+                    wake_present = voice_engine.using_wake_detector or has_wake_word(text)
+                    wake_confidence = "high" if voice_engine.using_wake_detector else ("high" if has_wake_word(text) else "none")
+                print(f"🔍 Wake word detected: {wake_present} (confidence: {wake_confidence})")
+
+                # Check if previous task is running (non-blocking check)
+                print(f"🔍 Step 2: Checking if previous task is running...")
+                try:
+                    task_running = _is_voice_task_running()
+                    is_speaking = bool(
+                        voice_engine and hasattr(voice_engine, "is_speaking") and voice_engine.is_speaking()
+                    )
+                    print(f"🔍 Step 2 result: task_running={task_running}, is_speaking={is_speaking}")
+                    if wake_present and task_running:
+                        print("⏳ Still working on the previous task. Incoming command will be queued once ready.")
+                    if wake_present and is_speaking and not task_running:
+                        print("🎧 Wake word detected while TTS is speaking. Stopping speech to listen.")
                         try:
-                            web_server.emit_processing()
+                            voice_engine.stop_speaking()
                         except Exception:
                             pass
+                except Exception as check_err:
+                    print(f"⚠️ Error checking task status: {check_err}")
+                    # Continue anyway
+
+                # Enhanced command detection with better intent recognition
+                print(f"🔍 Step 3: Analyzing command intent...")
+                is_command_like = False
+                command_confidence = 0.0
+                try:
+                    nl = normalize_text(text)
+                    print(f"🔍 Normalized text: '{nl}'")
+                    # High confidence command patterns
+                    # Extended with common voice patterns for coding so you can just say
+                    # "python code for leap year" and it will still be treated as a command,
+                    # even without explicitly saying "Bittu" first.
+                    high_confidence_starts = (
+                        "open ", "start ", "launch ", "run ", "execute ",
+                        "set ", "create ", "make ", "write ", "play ",
+                        "what ", "who ", "how ", "where ", "show ", "list ",
+                        "increase ", "decrease ", "turn on ", "turn off ",
+                        "enable ", "disable", "shutdown", "restart", "sleep", "lock",
+                        "tell me", "explain", "define", "search", "find",
+                        # Voice-friendly code generation triggers
+                        "python code", "java code", "javascript code", "c code",
+                        "c++ code", "c# code", "html code", "css code", "sql code",
+                        "code for", "program for", "write a program", "write python program"
+                    )
+                    # Medium confidence patterns
+                    medium_confidence_starts = (
+                        "can you", "could you", "please", "i want", "i need",
+                        "help me", "show me", "give me"
+                    )
+                    
+                    if any(nl.startswith(prefix) for prefix in high_confidence_starts):
+                        is_command_like = True
+                        command_confidence = 0.9
+                        print(f"🔍 High confidence command pattern detected")
+                    elif any(nl.startswith(prefix) for prefix in medium_confidence_starts):
+                        is_command_like = True
+                        command_confidence = 0.6
+                        print(f"🔍 Medium confidence command pattern detected")
+                    else:
+                        keyword_triggers = (
+                            " song", " music", " youtube", " google", " calculator",
+                            " notepad", " weather", " reminder", " open ", " launch ",
+                            " play ", " search ", " find ", " show ", " list ", " email"
+                        )
+                        if any(keyword in nl for keyword in keyword_triggers):
+                            is_command_like = True
+                            command_confidence = max(command_confidence, 0.7)
+                            print(f"🔍 Keyword-based command intent detected")
+                except Exception as intent_err:
+                    print(f"⚠️ Error in intent detection: {intent_err}")
+                    import traceback
+                    traceback.print_exc()
+
+                # Process if wake word detected OR phrase looks like a command (with confidence threshold)
+                should_process = wake_present or (is_command_like and command_confidence >= 0.6)
+                print(f"🔍 Step 4: should_process={should_process} (wake_present={wake_present}, is_command_like={is_command_like}, confidence={command_confidence})")
+                
+                if should_process:
+                    print(f"🔍 Step 5: Entering command processing block...")
+                    try:
+                        # Remove wake word and get the command (or use full text for command-like)
+                        if voice_engine.using_wake_detector:
+                            command = text.strip()
+                            print(f"🔍 Using wake detector mode, command: '{command}'")
+                        else:
+                            command = strip_wake_word(text) if wake_present else text
+                            print(f"🔍 Stripped wake word, command: '{command}'")
                         
-                        try:
-                            # Process the command
-                            resp = process_command(command)
-                            print_response(resp)
+                        # Normalize common typos and variations
+                        command = normalize_command_typos(command)
+                        print(f"📝 Extracted command: '{command}'")
+                        
+                        if pending_command_buffer and command.strip():
+                            command = f"{pending_command_buffer.strip()} {command.strip()}".strip()
+                            pending_command_buffer = ""
+                            print(f"📝 Combined with buffer: '{command}'")
+
+                        if command and command.strip():
+                            pending_wake_started_at = None
+                            pending_wake_prompted = False
+                            cmd_lower_for_followup = command.strip().lower()
                             
-                            # Speak the response (non-blocking - runs in separate thread)
-                            try:
-                                voice_response = create_voice_response(resp, command)
+                            # Quick check: if command is clearly complete (has action + target), process immediately
+                            # This prevents false positives on "incomplete" commands
+                            action_words = ["open", "start", "launch", "create", "write", "play", "set", "run", "execute"]
+                            has_action = any(cmd_lower_for_followup.startswith(act + " ") or cmd_lower_for_followup == act for act in action_words)
+                            print(f"🔍 Command analysis: has_action={has_action}, cmd='{cmd_lower_for_followup}'")
+                            
+                            if not has_action and command_needs_followup(cmd_lower_for_followup):
+                                pending_wake_command = True
+                                pending_command_buffer = command.strip()
+                                pending_wake_started_at = time.time()
+                                pending_wake_prompted = False
+                                print("⏳ Command sounds incomplete. Waiting for more details...")
                                 try:
-                                    web_server.emit_speaking(voice_response)
+                                    web_server.emit_listening()
                                 except Exception:
                                     pass
-                                # Speak is now non-blocking - returns immediately
-                                voice_engine.speak(voice_response)
-                                print("🔊 TTS started in background thread")
-                            except Exception as e:
-                                print(f"⚠️ Error speaking response: {e}")
+                                return
+
+                            if _is_voice_task_running():
+                                with command_queue_lock:
+                                    command_queue.append(command.strip())
+                                print(f"📥 Command queued while busy: '{command.strip()}'")
+                                speak_if_allowed("I'm finishing your previous request. I'll handle that next.")
+                                return
+
+                            command_to_run = command.strip()
+                            print(f"🎯 Processing command: '{command_to_run}'")
+                            print(f"⚡ Starting task execution immediately...")
+                            try:
+                                _start_voice_task(command_to_run)
+                                print(f"✅ _start_voice_task called successfully for '{command_to_run}'")
+                            except Exception as task_err:
+                                print(f"❌ ERROR starting voice task: {task_err}")
                                 import traceback
                                 traceback.print_exc()
-                            
-                            # Immediately ready for next command (no extra speech)
-                            announce_ready(command, resp)
-                            print("✅ Command completed. 🎤 Listening for 'bittu'...")
-                            print("   (TTS is speaking in background - listening will resume after TTS finishes)")
-                            
-                            # Verify voice assistant is still running
-                            if voice_enabled and not voice_engine.is_running():
-                                print("⚠️ Voice assistant stopped! Restarting...")
-                                if voice_engine.restart():
-                                    print("✅ Voice assistant restarted")
-                                else:
-                                    print("❌ Failed to restart voice assistant")
-                                    voice_enabled = False
-                        except Exception as e:
-                            print(f"❌ Error processing command: {e}")
-                            import traceback
-                            traceback.print_exc()
-                            # Still announce ready so listening continues
+                                # Try to continue listening
+                                try:
+                                    web_server.emit_listening()
+                                except Exception:
+                                    pass
+                            return
+                        else:
+                            print(f"⚠️ Command is empty after extraction, setting pending_wake_command")
+                            # Wake word only - set pending flag so next utterance is treated as the command
+                            pending_wake_command = True
+                            pending_wake_started_at = time.time()
+                            pending_wake_prompted = False
+                            print("🎤 Wake word detected. Waiting for your command...")
+                            if voice_wake_ack_enabled:
+                                try:
+                                    speak_if_allowed(voice_wake_prompt)
+                                except Exception:
+                                    pass
                             try:
                                 web_server.emit_listening()
                             except Exception:
                                 pass
-                    else:
-                        # Wake word only - just acknowledge briefly
-                        print("🎤 Wake word detected. Waiting for command...")
+                    except Exception as process_err:
+                        print(f"❌ CRITICAL ERROR in command processing: {process_err}")
+                        import traceback
+                        traceback.print_exc()
                         try:
-                            # Very brief acknowledgment
-                            voice_engine.speak("Yes")
+                            web_server.emit_listening()
                         except Exception:
                             pass
+                    else:
+                        # Wake word only - set pending flag so next utterance is treated as the command
+                        pending_wake_command = True
+                        pending_wake_started_at = time.time()
+                        pending_wake_prompted = False
+                        print("🎤 Wake word detected. Waiting for your command...")
+                        if voice_wake_ack_enabled:
+                            try:
+                                speak_if_allowed(voice_wake_prompt)
+                            except Exception:
+                                pass
                         try:
                             web_server.emit_listening()
                         except Exception:
@@ -316,27 +795,94 @@ def main():
                     pass
                 print("🔄 Continuing to listen despite error...")
 
-        # attach callback now that helper exists
-        voice_engine.on_transcript = on_voice_text
-        print("✅ Callback attached to voice engine")
-        print(f"✅ Callback function: {voice_engine.on_transcript}")
-        print("🎤 Voice assistant is ready. Listening for 'bittu'...")
+        # Create voice engine with callback BEFORE starting
+        voice_engine = VoiceAssistant(on_voice_text)
+        print("✅ Voice engine created with callback")
+        print(f"   Callback function: {voice_engine.on_transcript}")
         
-        # Verify voice engine is running
-        import time
-        time.sleep(0.5)  # Give it a moment to start
+        # Auto-start voice assistant immediately
+        show_output("🎙️ Initializing voice assistant...")
+        try:
+            if voice_engine.start():
+                voice_enabled = True
+                print("✅ Voice assistant start() returned True")
+                
+                # Give the listening thread a brief moment to actually start
+                import time
+                time.sleep(0.3)  # Minimal delay for thread to start
+                
+                # Verify voice engine is actually running
+                if voice_engine.is_running():
+                    print("✅ Voice engine thread is running and listening")
+                    show_success("🎙️ Voice assistant is listening NOW!")
+                    show_output("🎤 Say 'Bittu' followed by your command - I'm listening!")
+                else:
+                    print("⚠️ WARNING: Voice engine thread is NOT running!")
+                    print("   Attempting to restart...")
+                    if voice_engine.restart():
+                        print("✅ Voice engine restarted successfully")
+                        time.sleep(0.2)  # Brief pause after restart
+                        if voice_engine.is_running():
+                            show_success("🎙️ Voice assistant restarted and listening!")
+                        else:
+                            show_error("❌ Voice engine restarted but still not running")
+                            voice_enabled = False
+                    else:
+                        print("❌ Failed to restart voice engine")
+                        show_error("❌ Voice assistant thread failed to start properly")
+                        diag = getattr(voice_engine, 'diagnostics', lambda: 'No diagnostics')()
+                        show_output("Voice diagnostics: " + diag)
+                        voice_enabled = False
+                
+                # Don't speak greeting immediately - let listening start first
+                # The listening loop will start immediately and won't be blocked by TTS
+                if voice_enabled and voice_engine.is_running():
+                    show_output("🎤 Voice assistant is listening continuously. Say 'Bittu' followed by your command.")
+                    if voice_spoken_greeting_enabled and voice_tts_enabled:
+                        # Delay greeting slightly to ensure listening has started
+                        # Allow opt-in spoken greeting for those who prefer it
+                        def delayed_greeting():
+                            time.sleep(1.0)  # Wait for listening loop to start first
+                            if voice_engine.is_running():
+                                speak_if_allowed(voice_greeting_text)
+                                print("🔊 Greeting spoken. Voice assistant is actively listening for commands.")
+                        
+                        # Run greeting in separate thread so it doesn't block
+                        threading.Thread(target=delayed_greeting, daemon=True).start()
+                        print("✅ Listening started - greeting will be spoken shortly")
+                    else:
+                        print("✅ Listening started - no spoken greeting (ready immediately)")
+            else:
+                show_error("❌ Voice assistant failed to start. You can still use text commands.")
+                diag = getattr(voice_engine, 'diagnostics', lambda: 'No diagnostics')()
+                show_output("Voice diagnostics: " + diag)
+                voice_enabled = False
+        except Exception as e:
+            show_error(f"❌ Voice assistant initialization failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            show_output("You can still use text commands. Type 'help' for assistance.")
+            voice_enabled = False
+        
+        # Final verification - but don't delay if already running
         if voice_enabled:
             if voice_engine.is_running():
-                print("✅ Voice engine thread is running")
+                print("✅ FINAL CHECK: Voice engine is running and ready to receive commands")
+                print("   You can now say 'Bittu' followed by your command")
             else:
-                print("⚠️ WARNING: Voice engine thread is NOT running!")
-                print("   Attempting to restart...")
+                print("⚠️ FINAL CHECK: Voice engine is NOT running - attempting final restart...")
                 if voice_engine.restart():
-                    print("✅ Voice engine restarted successfully")
+                    print("✅ Voice engine restarted - should be listening now")
                 else:
-                    print("❌ Failed to restart voice engine")
+                    print("❌ CRITICAL: Voice engine failed to start. Check microphone permissions.")
+                    diag = getattr(voice_engine, 'diagnostics', lambda: 'No diagnostics')()
+                    print("Diagnostics:", diag)
 
         def print_response(resp: str) -> None:
+            # Ensure response is not None or empty
+            if not resp:
+                resp = "No response generated."
+            
             # Display response with appropriate formatting
             if "✅" in resp or "success" in resp.lower():
                 show_success(resp)
@@ -349,6 +895,9 @@ def main():
                 web_server.emit_listening()
             except Exception:
                 pass
+            llm_label = get_last_llm_label()
+            if llm_label:
+                print(f"🤖 Model: {llm_label}")
 
         # Main conversation loop
         while True:
@@ -379,7 +928,7 @@ def main():
                     if voice_enabled:
                         show_success("🎙️ Voice assistant is already enabled and listening!")
                         try:
-                            voice_engine.speak("I'm already listening. How can I help you?")
+                            speak_if_allowed("I'm already listening. How can I help you?")
                         except Exception:
                             pass
                     else:
@@ -392,7 +941,7 @@ def main():
                             voice_enabled = True
                             show_success("🎙️ Voice assistant enabled. Listening…")
                             try:
-                                voice_engine.speak("Voice assistant is now active. How can I help you?")
+                                speak_if_allowed("Voice assistant is now active. How can I help you?")
                             except Exception:
                                 pass
                             show_output("Voice assistant is now active. How can I help you?")
@@ -417,7 +966,7 @@ def main():
                             voice_enabled = False
                             show_success("🎙️ Voice assistant disabled. You can still use text commands.")
                             try:
-                                voice_engine.speak("Voice assistant disabled. You can still type commands.")
+                                speak_if_allowed("Voice assistant disabled. You can still type commands.")
                             except Exception:
                                 pass
                         except Exception:
@@ -443,6 +992,22 @@ def main():
                     else:
                         print("💡 Please enter a command or type 'help' for assistance.")
                     continue
+                elif user_input.lower().startswith("voice simulate "):
+                    simulated = user_input[len("voice simulate "):].strip()
+                    if not simulated:
+                        show_output("Provide text after 'voice simulate'.")
+                        continue
+                    show_output(f"🎛️ Simulating voice input: {simulated}")
+                    on_voice_text(simulated)
+                    continue
+                elif user_input.lower() in ["mute responses", "mute voice", "silent mode"]:
+                    voice_tts_enabled = False
+                    print("🔇 Voice responses muted.")
+                    continue
+                elif user_input.lower() in ["unmute responses", "voice responses on", "speak again"]:
+                    voice_tts_enabled = True
+                    print("🔊 Voice responses re-enabled.")
+                    continue
                 
                 # Process the command
                 try:
@@ -450,15 +1015,46 @@ def main():
                     web_server.emit_processing()
                 except Exception:
                     pass
-                response = process_command(user_input)
+                
+                print("⏳ Working on your request...")
+                # Process command and get response (same path as voice commands for consistency)
+                start_time = time.time()
+                try:
+                    print(f"🔄 Calling process_command('{user_input}')...")
+                    response = process_command(user_input)
+                    elapsed = time.time() - start_time
+                    print(f"⏱️ process_command completed in {elapsed:.2f}s")
+                except Exception as e:
+                    elapsed = time.time() - start_time
+                    print(f"❌ process_command failed after {elapsed:.2f}s: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    response = f"❌ Error processing command: {str(e)}"
+                
+                # Ensure response is not None or empty
+                if not response:
+                    response = "I'm not sure how to respond to that. Could you please rephrase your question?"
+                
+                # Always print the response to terminal
                 print_response(response)
-                # Speak and announce readiness for typed commands as well
+                
+                # Always speak the response (if voice is available)
                 try:
                     vr = create_voice_response(response, user_input)
-                    voice_engine.speak(vr)
-                    announce_ready(user_input, response)
-                except Exception:
-                    pass
+                    if vr and vr.strip():
+                        print(f"🔊 Preparing to speak: '{vr}'")
+                        if voice_engine and hasattr(voice_engine, 'speak'):
+                            speak_if_allowed(vr)
+                            print(f"✅ TTS called successfully: '{vr}'")
+                        else:
+                            print("❌ ERROR: voice_engine.speak() not available!")
+                except Exception as e:
+                    print(f"❌ ERROR speaking response: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                # Announce ready for next command
+                announce_ready(user_input, response)
                     
             except KeyboardInterrupt:
                 print("\n\n👋 Goodbye!")

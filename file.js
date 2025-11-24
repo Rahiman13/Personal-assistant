@@ -18,10 +18,16 @@
   const state = {
     mode: 'idle', // 'idle' | 'listening' | 'processing' | 'speaking'
     t: 0,
-    nodes: [],      // [{x,y,r,glow}]
-    connections: [], // [{a,b,len}]
-    packets: []     // flowing particles along edges
+    nodes: [],        // neuron points
+    axons: [],        // bézier curves between clusters [{p0,p1,c0,c1}]
+    packets: [],      // signals traveling along axons
+    clusters: [],     // cluster centers
+    orbs: [],         // floating decorative orbs
+    offset: { x: 0, y: 0 }, // translation to center network
+    scale: 1          // uniform scale to fit viewport
   };
+  // Professional palette per cluster (teal, aqua, blue, violet, amber, coral)
+  const clusterHues = [160, 175, 205, 260, 30, 12];
 
   function classify(msg){
     const m = String(msg || '');
@@ -108,48 +114,98 @@
   function initGraph(){
     if (!canvas || !ctx) return;
     const w = canvas.width, h = canvas.height;
-    // Generate neurons (network cells)
-    const count = 42;
-    state.nodes = [];
-    for (let i=0;i<count;i++){
-      const x = w*0.1 + Math.random()*w*0.8;
-      const y = h*0.15 + Math.random()*h*0.7;
-      const r = 4 + Math.random()*3;
-      state.nodes.push({x, y, baseR: r, glow: 0});
-    }
-    // Connect each node to its K nearest neighbors
-    const K = 3;
-    const connections = [];
-    for (let i=0;i<state.nodes.length;i++){
-      const dists = [];
-      for (let j=0;j<state.nodes.length;j++){
-        if (i===j) continue;
-        const dx = state.nodes[j].x - state.nodes[i].x;
-        const dy = state.nodes[j].y - state.nodes[i].y;
-        dists.push({j, d: Math.hypot(dx,dy)});
-      }
-      dists.sort((a,b)=>a.d-b.d);
-      for (let k=0;k<K;k++){
-        const neighbor = dists[k];
-        if (!neighbor) continue;
-        const a = i, b = neighbor.j;
-        if (a<b) connections.push({a,b,len: neighbor.d});
-      }
-    }
-    // Remove duplicates
-    const uniq = new Map();
-    for (const c of connections){
-      const key = c.a+"-"+c.b;
-      if (!uniq.has(key)) uniq.set(key, c);
-    }
-    state.connections = Array.from(uniq.values());
+    // Define bilateral cluster centers approximating cortical regions
+    state.clusters = [];
+    const left = [
+      {x:w*0.33, y:h*0.35}, {x:w*0.28, y:h*0.50}, {x:w*0.35, y:h*0.65}
+    ];
+    const right = [
+      {x:w*0.67, y:h*0.35}, {x:w*0.72, y:h*0.50}, {x:w*0.65, y:h*0.65}
+    ];
+    state.clusters = left.concat(right).map((c, i)=>({ ...c, id:i, hue: clusterHues[i % clusterHues.length] }));
 
-    // Seed flowing packets
-    state.packets = [];
-    for (let p=0;p<30;p++){
-      const edge = state.connections[Math.floor(Math.random()*state.connections.length)];
-      state.packets.push({edge, t: Math.random(), speed: 0.002 + Math.random()*0.006});
+    // Populate neurons around clusters with organic jitter
+    state.nodes = [];
+    for (const c of state.clusters){
+      const localCount = 26;
+      for (let i=0;i<localCount;i++){
+        const ang = Math.random()*Math.PI*2;
+        const rad = 18 + Math.random()*42;
+        const jitter = (Math.sin(i*2.13)+Math.cos(i*3.7))*2;
+        const x = c.x + Math.cos(ang)*(rad+jitter);
+        const y = c.y + Math.sin(ang)*(rad-jitter);
+        const r = 3 + Math.random()*2.5;
+        state.nodes.push({x, y, baseR:r, clusterId: c.id, hue: c.hue});
+      }
     }
+
+    // Create axon bézier curves across and within hemispheres
+    state.axons = [];
+    const all = state.clusters;
+    function bez(p0,p1,scale){
+      const mx = (p0.x+p1.x)/2, my=(p0.y+p1.y)/2;
+      const nx = p1.y-p0.y, ny = -(p1.x-p0.x);
+      const len = Math.hypot(nx,ny)||1;
+      const ux = nx/len, uy=ny/len;
+      const s = scale*(0.2+Math.random()*0.8);
+      const hue = Math.round(((p0.hue || 160) + (p1.hue || 160))/2);
+      return {p0, p1, c0:{x: mx+ux*s, y: my+uy*s}, c1:{x: mx-ux*s, y: my-uy*s}, hue};
+    }
+    for (let i=0;i<all.length;i++){
+      for (let j=i+1;j<all.length;j++){
+        const p0 = all[i], p1 = all[j];
+        const d = Math.hypot(p1.x-p0.x, p1.y-p0.y);
+        if (d> w*0.42) continue;
+        if (Math.random()<0.55){
+          state.axons.push(bez(p0,p1, d*0.35));
+        }
+      }
+    }
+
+    // Seed signals along axons
+    state.packets = [];
+    for (let p=0;p<46;p++){
+      const ax = state.axons[Math.floor(Math.random()*state.axons.length)];
+      state.packets.push({axon: ax, t: Math.random(), speed: 0.002 + Math.random()*0.005});
+    }
+
+    // Initial layout
+    updateLayout();
+
+    // Floating orbs
+    state.orbs = [];
+    for (let k=0;k<12;k++){
+      state.orbs.push({
+        x: Math.random()*w,
+        y: Math.random()*h,
+        r: 8 + Math.random()*14,
+        dx: (Math.random()*2-1)*0.2,
+        dy: (Math.random()*2-1)*0.2,
+        hue: 120 + Math.random()*120
+      });
+    }
+  }
+
+  function computeBounds(){
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    const includePoint = (pt)=>{ if (!pt) return; if (pt.x<minX) minX=pt.x; if (pt.y<minY) minY=pt.y; if (pt.x>maxX) maxX=pt.x; if (pt.y>maxY) maxY=pt.y; };
+    for (const n of state.nodes) includePoint(n);
+    for (const a of state.axons){ includePoint(a.p0); includePoint(a.p1); includePoint(a.c0); includePoint(a.c1); }
+    if (minX===Infinity) return null;
+    return { minX, minY, maxX, maxY, width: maxX-minX, height: maxY-minY, cx: (minX+maxX)/2, cy: (minY+maxY)/2 };
+  }
+
+  function updateLayout(){
+    if (!canvas) return;
+    const b = computeBounds();
+    if (!b) { state.offset.x=0; state.offset.y=0; state.scale=1; return; }
+    const pad = 0.88; // fit factor
+    const sx = (canvas.width*pad) / (b.width || 1);
+    const sy = (canvas.height*pad) / (b.height || 1);
+    state.scale = Math.max(0.5, Math.min(sx, sy));
+    const w2 = canvas.width/2, h2 = canvas.height/2;
+    state.offset.x = w2 - b.cx*state.scale;
+    state.offset.y = h2 - b.cy*state.scale;
   }
 
   function clear(){
@@ -159,42 +215,27 @@
 
   function drawBrainOutline(){
     if (!ctx) return;
-    const w = canvas.width, h = canvas.height;
-    ctx.save();
-    ctx.fillStyle = 'rgba(10, 24, 22, 0.9)';
-    ctx.strokeStyle = 'rgba(0, 255, 136, 0.2)';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    // Simple organic shape
-    ctx.moveTo(w*0.2, h*0.35);
-    ctx.bezierCurveTo(w*0.25, h*0.15, w*0.45, h*0.10, w*0.50, h*0.20);
-    ctx.bezierCurveTo(w*0.55, h*0.10, w*0.75, h*0.15, w*0.80, h*0.35);
-    ctx.bezierCurveTo(w*0.85, h*0.55, w*0.75, h*0.75, w*0.55, h*0.78);
-    ctx.bezierCurveTo(w*0.50, h*0.82, w*0.45, h*0.82, w*0.40, h*0.78);
-    ctx.bezierCurveTo(w*0.25, h*0.75, w*0.15, h*0.55, w*0.2, h*0.35);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-    ctx.restore();
+    // Intentionally left blank: no silhouette, only network
   }
 
-  function drawConnections(){
+  function drawAxons(){
     if (!ctx) return;
     ctx.save();
-    for (const c of state.connections){
-      const n1 = state.nodes[c.a], n2 = state.nodes[c.b];
-      let hue;
-      if (state.mode==='listening') hue = 150;
-      else if (state.mode==='speaking') hue = 30;
-      else if (state.mode==='processing') hue = 200;
-      else hue = 140;
-      const pulse = (Math.sin(state.t*0.05 + c.len*0.02)+1)/2;
-      const alpha = state.mode==='idle' ? 0.07 : 0.14 + pulse*0.2;
-      ctx.strokeStyle = `hsla(${hue}, 90%, 60%, ${alpha})`;
-      ctx.lineWidth = 0.8 + pulse*0.8;
+    ctx.translate(state.offset.x, state.offset.y);
+    ctx.scale(state.scale, state.scale);
+    for (const a of state.axons){
+      // Base hue per axon with subtle state tint
+      let baseHue = a.hue || 160;
+      let tint = 0;
+      if (state.mode==='speaking') tint = -10; else if (state.mode==='processing') tint = +20; else if (state.mode==='listening') tint = +0;
+      const hue = (baseHue + tint + 360) % 360;
+      const pulse = (Math.sin(state.t*0.03)+1)/2;
+      const alpha = state.mode==='idle' ? 0.06 : 0.12 + pulse*0.2;
+      ctx.strokeStyle = `hsla(${hue}, 95%, 62%, ${alpha})`;
+      ctx.lineWidth = 1.0 + pulse*0.7;
       ctx.beginPath();
-      ctx.moveTo(n1.x, n1.y);
-      ctx.lineTo(n2.x, n2.y);
+      ctx.moveTo(a.p0.x, a.p0.y);
+      ctx.bezierCurveTo(a.c0.x, a.c0.y, a.c1.x, a.c1.y, a.p1.x, a.p1.y);
       ctx.stroke();
     }
     ctx.restore();
@@ -203,26 +244,33 @@
   function drawNodes(){
     if (!ctx) return;
     ctx.save();
+    ctx.translate(state.offset.x, state.offset.y);
+    ctx.scale(state.scale, state.scale);
     for (let i=0;i<state.nodes.length;i++){
       const n = state.nodes[i];
-      const pulse = (Math.sin(state.t*0.06 + i*0.9)+1)/2; // 0..1
+      const pulse = (Math.sin(state.t*0.06 + i*0.7)+1)/2;
       const r = n.baseR * (0.9 + pulse*0.8);
-      let hue;
-      if (state.mode==='listening') hue = 150;
-      else if (state.mode==='speaking') hue = 30;
-      else if (state.mode==='processing') hue = 200;
-      else hue = 140;
-      const glow = state.mode==='idle' ? 0.06 : 0.22 + pulse*0.35;
+      // Cluster-driven color with state tint
+      const baseHue = n.hue || 160;
+      let tint = 0;
+      if (state.mode==='speaking') tint = -10; else if (state.mode==='processing') tint = +20; else if (state.mode==='listening') tint = +0;
+      const hue = (baseHue + tint + 360) % 360;
+      const glow = state.mode==='idle' ? 0.06 : 0.30 + pulse*0.46;
       // core
       const grad = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, r+6);
-      grad.addColorStop(0, `hsla(${hue}, 95%, ${state.mode==='idle'?70:80}%, 0.95)`);
-      grad.addColorStop(1, `hsla(${hue}, 80%, 50%, 0.15)`);
+      grad.addColorStop(0, `hsla(${hue}, 92%, ${state.mode==='idle'?80:88}%, 1)`);
+      grad.addColorStop(0.7, `hsla(${hue}, 85%, 58%, 0.28)`);
+      grad.addColorStop(1, `hsla(${hue}, 80%, 54%, 0.16)`);
       ctx.fillStyle = grad;
       ctx.shadowColor = `hsla(${hue}, 100%, 65%, ${glow})`;
-      ctx.shadowBlur = 14 + pulse*20;
+      ctx.shadowBlur = 22 + pulse*26;
       ctx.beginPath();
       ctx.arc(n.x, n.y, r, 0, Math.PI*2);
       ctx.fill();
+      // subtle outline for structure
+      ctx.lineWidth = 0.6;
+      ctx.strokeStyle = `hsla(${hue}, 80%, 70%, 0.15)`;
+      ctx.stroke();
     }
     ctx.restore();
   }
@@ -230,35 +278,47 @@
   function drawPackets(){
     if (!ctx) return;
     ctx.save();
+    ctx.translate(state.offset.x, state.offset.y);
+    ctx.scale(state.scale, state.scale);
     for (const p of state.packets){
-      const c = p.edge;
-      const n1 = state.nodes[c.a], n2 = state.nodes[c.b];
-      const x = n1.x + (n2.x - n1.x) * p.t;
-      const y = n1.y + (n2.y - n1.y) * p.t;
-      let hue;
-      if (state.mode==='processing') hue = 200; else if (state.mode==='speaking') hue = 30; else hue = 150;
-      ctx.fillStyle = `hsla(${hue}, 95%, 70%, 0.9)`;
+      const a = p.axon;
+      // cubic bezier interpolation
+      const t = p.t;
+      const x = Math.pow(1-t,3)*a.p0.x + 3*Math.pow(1-t,2)*t*a.c0.x + 3*(1-t)*t*t*a.c1.x + t*t*t*a.p1.x;
+      const y = Math.pow(1-t,3)*a.p0.y + 3*Math.pow(1-t,2)*t*a.c0.y + 3*(1-t)*t*t*a.c1.y + t*t*t*a.p1.y;
+      // Use axon's hue for packet color with brightness bump during processing
+      const baseHue = a.hue || 160;
+      const hue = (baseHue + (state.mode==='processing'? 10 : 0)) % 360;
+      ctx.fillStyle = `hsla(${hue}, 96%, 78%, 0.98)`;
       ctx.beginPath();
-      ctx.arc(x, y, 1.6, 0, Math.PI*2);
+      ctx.arc(x, y, 1.8, 0, Math.PI*2);
       ctx.fill();
     }
     ctx.restore();
   }
 
+  function drawOrbs(){
+    if (!ctx) return;
+    // Intentionally blank: no decorative orbs
+  }
+
   function animate(){
     if (!ctx) return;
     state.t += 1;
+    // Recompute layout in case canvas size changed
+    updateLayout();
     clear();
-    drawBrainOutline();
-    drawConnections();
+    // Only the network
+    drawAxons();
     drawNodes();
+    // no orbs
     // advance packets
     for (const p of state.packets){
-      p.t += p.speed * (state.mode==='processing' ? 2.0 : 1.0);
+      p.t += p.speed * (state.mode==='processing' ? 2.0 : 1.1);
       if (p.t > 1){
         p.t = 0;
-        // switch edge randomly
-        p.edge = state.connections[Math.floor(Math.random()*state.connections.length)] || p.edge;
+        // switch axon randomly
+        p.axon = state.axons[Math.floor(Math.random()*state.axons.length)] || p.axon;
       }
     }
     drawPackets();

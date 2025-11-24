@@ -7,6 +7,21 @@ import platform
 
 def handle(command):
     command_lower = command.lower()
+    # Quick "play <something>" intent → default to YouTube search
+    if command_lower.startswith("play "):
+        try:
+            song = command_lower[len("play "):].strip()
+            for w in ["song", "songs", "please", "on youtube", "in youtube", "youtube"]:
+                song = song.replace(w, "").strip()
+            if song:
+                from urllib.parse import quote_plus
+                q = quote_plus(song)
+                webbrowser.open(f"https://www.youtube.com/results?search_query={q}")
+                return f"Searching YouTube for '{song}'"
+        except Exception:
+            pass
+        webbrowser.open("https://youtube.com")
+        return "Opening YouTube"
     
     # If user says 'open <site>' without specifying a browser, try known site aliases
     site_url = _extract_site_only(command_lower)
@@ -21,6 +36,29 @@ def handle(command):
     
     # Web applications
     if "youtube" in command_lower:
+        # If user asked to play something on YouTube, try to extract the query
+        if "play" in command_lower:
+            try:
+                import re
+                m = re.search(r"play\s+(.+)$", command_lower)
+                if m:
+                    song = m.group(1).strip()
+                    # Remove trailing filler words
+                    for w in ["song", "songs", "please", "on youtube", "in youtube", "youtube"]:
+                        song = song.replace(w, "").strip()
+                    if song:
+                        from urllib.parse import quote_plus
+                        q = quote_plus(song)
+                        url = f"https://www.youtube.com/results?search_query={q}"
+                        webbrowser.open(url)
+                        return f"Searching YouTube for '{song}'"
+                # No song captured after 'play' → ask for clarification
+                return "Which song should I play on YouTube?"
+            except Exception:
+                # Fallback to opening YouTube if parsing fails
+                webbrowser.open("https://youtube.com")
+                return "Opening YouTube"
+        # Otherwise just open YouTube
         webbrowser.open("https://youtube.com")
         return "Opening YouTube"
     elif "google" in command_lower or "chrome" in command_lower:
@@ -43,6 +81,14 @@ def handle(command):
     elif "spotify" in command_lower:
         webbrowser.open("https://open.spotify.com")
         return "Opening Spotify"
+    elif "whatsapp" in command_lower:
+        desktop_result = open_whatsapp()
+        if desktop_result:
+            return desktop_result
+        webbrowser.open("https://web.whatsapp.com")
+        return (
+            "Opening WhatsApp Web. Scan the QR code from your phone to start messaging."
+        )
     
     # Desktop applications
     elif "notepad" in command_lower:
@@ -733,3 +779,26 @@ def open_yarn():
         return "Showing yarn help"
     except:
         return "yarn not found. Try installing it with: npm install -g yarn"
+
+def open_whatsapp():
+    """Open WhatsApp Desktop if available."""
+    if platform.system() != "Windows":
+        return None
+    possible_paths = [
+        os.path.join(os.getenv("LOCALAPPDATA", ""), "WhatsApp", "WhatsApp.exe"),
+        os.path.join(os.getenv("PROGRAMFILES", ""), "WhatsApp", "WhatsApp.exe"),
+        os.path.join(os.getenv("PROGRAMFILES(X86)", ""), "WhatsApp", "WhatsApp.exe"),
+    ]
+    for path in possible_paths:
+        normalized = os.path.expandvars(path)
+        if normalized and os.path.exists(normalized):
+            try:
+                subprocess.run([normalized], check=False)
+                return "Opening WhatsApp"
+            except Exception:
+                continue
+    # Try Windows app lookup (Microsoft Store version)
+    launch_result = _open_windows_app_by_name("WhatsApp")
+    if launch_result:
+        return launch_result
+    return None

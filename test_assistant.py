@@ -1,90 +1,41 @@
-#!/usr/bin/env python3
-"""
-Test script for Personal AI Assistant
-This script tests various commands to ensure the assistant works correctly
-"""
+import pytest
 
-import os
-import sys
-import time
-from core.brain import process_command
+from core import brain
+from core.classifier import TaskType, classify_task
 
-def test_command(command, expected_keywords=None):
-    """Test a command and return the result"""
-    print(f"\n🧪 Testing: '{command}'")
-    print("-" * 50)
-    
-    try:
-        result = process_command(command)
-        print(f"✅ Result: {result}")
-        
-        if expected_keywords:
-            found_keywords = [kw for kw in expected_keywords if kw.lower() in result.lower()]
-            if found_keywords:
-                print(f"✅ Found expected keywords: {found_keywords}")
-            else:
-                print(f"⚠️  Expected keywords not found: {expected_keywords}")
-        
-        return result
-    except Exception as e:
-        print(f"❌ Error: {str(e)}")
-        return None
 
-def main():
-    """Run comprehensive tests"""
-    print("🤖 Personal AI Assistant - Test Suite")
-    print("=" * 60)
-    
-    # Test basic commands
-    print("\n📝 Testing Basic Commands:")
-    test_command("hello", ["hello", "assistant"])
-    test_command("help", ["help", "commands"])
-    test_command("what can you do", ["capabilities", "help"])
-    
-    # Test application opening
-    print("\n🌐 Testing Application Opening:")
-    test_command("open youtube", ["youtube", "opening"])
-    test_command("launch vs code", ["vs code", "opening"])
-    test_command("start calculator", ["calculator", "opening"])
-    
-    # Test weather
-    print("\n🌤️ Testing Weather:")
-    test_command("weather in London", ["weather", "london"])
-    
-    # Test reminders
-    print("\n⏰ Testing Reminders:")
-    test_command("remind me to test in 1 minute", ["reminder", "test"])
-    
-    # Test file operations
-    print("\n📁 Testing File Operations:")
-    test_command("list files", ["files", "directory"])
-    test_command("create file test.txt", ["created", "test.txt"])
-    
-    # Test coding commands
-    print("\n💻 Testing Coding Commands:")
-    test_command("create Python script", ["python", "script", "created"])
-    test_command("create HTML file", ["html", "created"])
-    test_command("create CSS file", ["css", "created"])
-    test_command("create JavaScript file", ["javascript", "created"])
-    test_command("create JSON file", ["json", "created"])
-    
-    # Test system commands
-    print("\n⚙️ Testing System Commands:")
-    test_command("run python --version", ["python", "version"])
-    
-    # Test navigation
-    print("\n📂 Testing Navigation:")
-    test_command("cd .", ["navigated", "current"])
-    
-    # Test conversation
-    print("\n💬 Testing Conversation:")
-    test_command("tell me a joke", ["joke", "funny"])
-    test_command("what is Python?", ["python", "programming"])
-    
-    print("\n" + "=" * 60)
-    print("🎉 Test suite completed!")
-    print("💡 If you see any ❌ errors above, those features may need attention.")
-    print("✅ All other tests passed successfully!")
+@pytest.fixture(autouse=True)
+def disable_persona(monkeypatch):
+    """Ensure stylization does not hit the LLM during tests."""
+    monkeypatch.setattr(brain, "stylize_response", lambda command, text: text)
 
-if __name__ == "__main__":
-    main()
+
+def test_classifier_detects_code_generation():
+    assert classify_task("please generate code for a rest api") == TaskType.CODE_GENERATION
+
+
+def test_classifier_detects_email():
+    assert classify_task("draft an email to postpone the meeting") == TaskType.EMAIL_WRITING
+
+
+def test_code_generation_routes_to_agent(monkeypatch):
+    monkeypatch.setattr(brain.code_generator, "handle", lambda cmd: "CODE_AGENT")
+    monkeypatch.setattr(brain.email_writer, "handle", lambda cmd: "EMAIL_AGENT")
+    monkeypatch.setattr(brain, "ask_gpt", lambda cmd: "FALLBACK")
+    result = brain.process_command("generate code for a fibonacci function")
+    assert "CODE_AGENT" in result
+
+
+def test_email_writing_routes_to_agent(monkeypatch):
+    monkeypatch.setattr(brain.email_writer, "handle", lambda cmd: "EMAIL_AGENT")
+    monkeypatch.setattr(brain.code_generator, "handle", lambda cmd: "CODE_AGENT")
+    monkeypatch.setattr(brain, "ask_gpt", lambda cmd: "FALLBACK")
+    result = brain.process_command("write an email to my team about the deadline")
+    assert "EMAIL_AGENT" in result
+
+
+def test_general_prompt_routes_to_local_llm(monkeypatch):
+    monkeypatch.setattr(brain, "_general_ai_response", lambda cmd: "GENERAL_AGENT")
+    monkeypatch.setattr(brain, "ask_gpt", lambda cmd: "FALLBACK")
+    result = brain.process_command("explain what an api gateway does")
+    assert "GENERAL_AGENT" in result

@@ -31,7 +31,7 @@ class PersonalAIAssistant:
         self.initialize_voice_assistant()
         
     def initialize_voice_assistant(self):
-        """Initialize the voice assistant"""
+        """Initialize and auto-start the voice assistant"""
         try:
             self.voice_engine = VoiceAssistant(self.handle_voice_input)
             self.gui.queue_message({
@@ -39,6 +39,25 @@ class PersonalAIAssistant:
                 'text': 'Voice assistant initialized successfully!',
                 'sender': 'system'
             })
+            # Auto-start voice assistant immediately
+            if self.voice_engine.start():
+                self.voice_enabled = True
+                self.gui.queue_message({
+                    'type': 'voice_state',
+                    'listening': True
+                })
+                self.gui.queue_message({
+                    'type': 'chat_message',
+                    'text': 'Voice assistant enabled. Say "Bittu" followed by your command.',
+                    'sender': 'system'
+                })
+                self.speak_response("Voice assistant enabled. I'm listening for your commands.")
+            else:
+                self.gui.queue_message({
+                    'type': 'chat_message',
+                    'text': 'Failed to start voice assistant. You can still use text commands.',
+                    'sender': 'system'
+                })
         except Exception as e:
             self.gui.queue_message({
                 'type': 'chat_message',
@@ -166,67 +185,94 @@ class PersonalAIAssistant:
             })
             
     def create_voice_response(self, full_response: str, command: str) -> str:
-        """Create shorter, more natural voice responses"""
+        """Create very short, concise voice responses (max 80 characters)"""
+        if not full_response or not full_response.strip():
+            return "Done."
+        
         command_lower = command.lower().strip()
         
-        # Handle specific commands with short responses
+        # Handle specific commands with very short responses
         if "open youtube" in command_lower or "youtube" in command_lower:
-            return "Opening YouTube"
+            return "Opening YouTube."
         elif "open google" in command_lower or "google" in command_lower:
-            return "Opening Google"
+            return "Opening Google."
         elif "open gmail" in command_lower or "gmail" in command_lower:
-            return "Opening Gmail"
+            return "Opening Gmail."
         elif "open github" in command_lower or "github" in command_lower:
-            return "Opening GitHub"
+            return "Opening GitHub."
         elif "open calculator" in command_lower or "calculator" in command_lower:
-            return "Opening Calculator"
+            return "Opening Calculator."
         elif "open notepad" in command_lower or "notepad" in command_lower:
-            return "Opening Notepad"
+            return "Opening Notepad."
         elif "open vs code" in command_lower or "code" in command_lower:
-            return "Opening VS Code"
+            return "Opening VS Code."
         elif "weather" in command_lower:
-            if "temperature" in full_response.lower():
-                import re
-                temp_match = re.search(r'(\d+[°°]?[CF]?)', full_response)
-                if temp_match:
-                    return f"Weather: {temp_match.group(1)}"
-            return "Getting weather information"
+            import re
+            temp_match = re.search(r'(\d+[°°]?[CF]?)', full_response)
+            if temp_match:
+                return f"Temperature is {temp_match.group(1)}."
+            return "Weather information retrieved."
         elif "create" in command_lower and ("file" in command_lower or "script" in command_lower):
             if "python" in command_lower:
-                return "Creating Python script"
+                return "Python file created."
             elif "html" in command_lower:
-                return "Creating HTML file"
+                return "HTML file created."
             elif "css" in command_lower:
-                return "Creating CSS file"
+                return "CSS file created."
             elif "javascript" in command_lower or "js" in command_lower:
-                return "Creating JavaScript file"
+                return "JavaScript file created."
             else:
-                return "Creating file"
+                return "File created."
         elif "remind" in command_lower or "reminder" in command_lower:
-            return "Reminder set"
+            return "Reminder set."
         elif "help" in command_lower:
-            return "Here are the available commands"
+            return "Check the terminal for available commands."
         elif "hello" in command_lower or "hi" in command_lower:
-            return "Hello! How can I help you?"
+            return "Hello! How can I help?"
         elif "thank" in command_lower:
             return "You're welcome!"
         elif "bye" in command_lower or "goodbye" in command_lower:
-            return "Goodbye! Have a great day!"
+            return "Goodbye!"
+        elif "time" in command_lower:
+            import re
+            time_match = re.search(r'(\d{1,2}:\d{2}(?:\s*[AP]M)?)', full_response, re.IGNORECASE)
+            if time_match:
+                return f"The time is {time_match.group(1)}."
+            return "Time retrieved."
+        elif "date" in command_lower:
+            return "Date retrieved."
+        elif "search" in command_lower:
+            return "Searching."
+        elif "play" in command_lower:
+            return "Playing."
         else:
-            # For other commands, use a shortened version
-            if len(full_response) > 100:
-                if "✅" in full_response:
-                    return "Done!"
-                elif "❌" in full_response:
-                    return "Sorry, I couldn't do that"
+            # For other commands, use very short summary (max 80 chars)
+            import re
+            cleaned = re.sub(r"[\u2600-\u27BF\U0001F300-\U0001FAFF]", "", full_response)
+            cleaned = cleaned.replace("\n", " ").strip()
+            
+            # Check for success/error indicators
+            if "✅" in full_response or "success" in cleaned.lower():
+                return "Done."
+            elif "❌" in full_response or "error" in cleaned.lower() or "failed" in cleaned.lower():
+                return "Sorry, couldn't do that."
+            
+            # Get first sentence only (max 80 chars)
+            sentences = [s.strip() for s in re.split(r'[.!?]\s+', cleaned) if s.strip()]
+            if sentences:
+                first_sentence = sentences[0]
+                if len(first_sentence) <= 80:
+                    return first_sentence + "."
                 else:
-                    return "Command completed"
-            else:
-                # Clean the response for TTS
-                import re
-                cleaned = re.sub(r"[\u2600-\u27BF\U0001F300-\U0001FAFF]", "", full_response)
-                cleaned = cleaned.replace("\n", " ").strip()
-                return cleaned[:200]
+                    # Truncate to 80 chars at word boundary
+                    truncated = first_sentence[:77]
+                    last_space = truncated.rfind(' ')
+                    if last_space > 50:
+                        truncated = truncated[:last_space]
+                    return truncated + "..."
+            
+            # Fallback: just say "Done" for anything else
+            return "Done."
                 
     def speak_response(self, text: str):
         """Speak a response using the voice engine"""
@@ -314,7 +360,7 @@ class PersonalAIAssistant:
             })
             self.gui.queue_message({
                 'type': 'chat_message',
-                'text': 'Click "Start Voice Assistant" to begin voice interaction, or type commands directly.',
+                'text': 'Voice assistant is starting automatically. Say "Bittu" followed by your command, or type commands directly.',
                 'sender': 'system'
             })
             

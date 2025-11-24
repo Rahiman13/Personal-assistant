@@ -23,9 +23,6 @@
     .btn:hover{ border-color: rgba(0,255,136,0.6); }
     main{ display:grid; grid-template-columns: 1.8fr 1fr; gap:14px; padding:14px; flex:1; min-height:0; }
     .panel{ background:var(--panel); border:1px solid rgba(0,255,136,0.08); border-radius:12px; box-shadow: 0 10px 40px rgba(0,0,0,0.35) inset, 0 1px 0 rgba(255,255,255,0.03); overflow:hidden; }
-    .viz-panel{ display:flex; flex-direction:column; }
-    .viz-panel h3{ flex:0 0 auto; }
-    .viz-panel .viz-wrap{ flex:1 1 auto; align-items:center; justify-content:center; }
     .panel h3{ margin:0; padding:10px 12px; font-weight:700; color:#bdf6e3; background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.00)); border-bottom:1px solid rgba(0,255,136,0.06); font-size:13px; letter-spacing:0.3px; display:flex; align-items:center; justify-content:space-between; }
     .viz-wrap{ position:relative; aspect-ratio: 16/9; min-height:520px; display:flex; align-items:center; justify-content:center; background:transparent; padding: 0 8px; }
     .viz-wrap::before{ content: none; }
@@ -81,7 +78,7 @@
       </div>
     </header>
     <main>
-      <section class="panel viz-panel">
+      <section class="panel">
         <h3>
           <span>Neural Activity</span>
           <small style="font-weight:400;color:#8be1c8;opacity:.8">live visual</small>

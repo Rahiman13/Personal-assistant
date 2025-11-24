@@ -1,14 +1,24 @@
 # skills/coding_assistant.py
-import os
 import re
 import subprocess
+import textwrap
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from skills.path_utils import (
+    get_base_output_dir,
+    resolve_access_path,
+    resolve_output_path,
+)
 
 def handle(command):
     """Handle coding-related commands"""
     command_lower = command.lower()
     
-    if "create python script" in command_lower or "create py file" in command_lower:
+    if _is_file_write_request(command_lower):
+        return create_generic_file(command)
+    elif "create python script" in command_lower or "create py file" in command_lower:
         return create_python_script(command)
     elif "create html file" in command_lower or "create html" in command_lower:
         return create_html_file(command)
@@ -31,6 +41,39 @@ def handle(command):
     else:
         return get_coding_help()
 
+def create_generic_file(command):
+    """Create (or overwrite) a file, optionally generating content from an instruction."""
+    instruction = extract_file_content(command)
+    filename = extract_filename_from_command(command) or infer_default_filename(command, instruction)
+    if not filename:
+        return "❌ Please specify a filename. Example: 'create file notes.txt'"
+    
+    generated_content = generate_content_from_instruction(
+        instruction or command, filename
+    )
+    content_to_write = (
+        generated_content if generated_content is not None
+        else (instruction.strip() + "\n" if instruction else "# Created by Personal AI Assistant\n")
+    )
+    
+    try:
+        output_path = resolve_output_path(filename)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(content_to_write.rstrip() + "\n")
+        
+        preview = content_to_write.strip()
+        if len(preview) > 160:
+            preview = preview[:157] + "..."
+        
+        summary = "with generated code/content" if generated_content else "with provided content"
+        return (
+            f"✅ Created file '{output_path.name}' {summary}.\n"
+            f"📄 Preview:\n{preview}\n"
+            f"📁 Location: {output_path}"
+        )
+    except Exception as e:
+        return f"❌ Error creating file: {str(e)}"
+
 def create_python_script(command):
     """Create a Python script with basic template"""
     filename = extract_filename_from_command(command) or "script.py"
@@ -52,9 +95,14 @@ def main():
 if __name__ == "__main__":
     main()
 '''
-        with open(filename, 'w', encoding='utf-8') as f:
+        output_path = resolve_output_path(filename)
+        with open(output_path, 'w', encoding='utf-8') as f:
             f.write(template)
-        return f"✅ Created Python script: {filename}\n💡 Template includes main function and proper structure"
+        return (
+            f"✅ Created Python script: {output_path.name}\n"
+            f"💡 Template includes main function and proper structure\n"
+            f"📁 Location: {output_path}"
+        )
     except Exception as e:
         return f"❌ Error creating Python script: {str(e)}"
 
@@ -96,9 +144,14 @@ def create_html_file(command):
 </body>
 </html>
 '''
-        with open(filename, 'w', encoding='utf-8') as f:
+        output_path = resolve_output_path(filename)
+        with open(output_path, 'w', encoding='utf-8') as f:
             f.write(template)
-        return f"✅ Created HTML file: {filename}\n💡 Template includes responsive design and modern styling"
+        return (
+            f"✅ Created HTML file: {output_path.name}\n"
+            f"💡 Template includes responsive design and modern styling\n"
+            f"📁 Location: {output_path}"
+        )
     except Exception as e:
         return f"❌ Error creating HTML file: {str(e)}"
 
@@ -167,9 +220,14 @@ p {{
     margin-bottom: 20px;
 }}
 '''
-        with open(filename, 'w', encoding='utf-8') as f:
+        output_path = resolve_output_path(filename)
+        with open(output_path, 'w', encoding='utf-8') as f:
             f.write(template)
-        return f"✅ Created CSS file: {filename}\n💡 Template includes modern CSS with utility classes"
+        return (
+            f"✅ Created CSS file: {output_path.name}\n"
+            f"💡 Template includes modern CSS with utility classes\n"
+            f"📁 Location: {output_path}"
+        )
     except Exception as e:
         return f"❌ Error creating CSS file: {str(e)}"
 
@@ -213,9 +271,14 @@ if (document.readyState === 'loading') {{
     App.init();
 }}
 '''
-        with open(filename, 'w', encoding='utf-8') as f:
+        output_path = resolve_output_path(filename)
+        with open(output_path, 'w', encoding='utf-8') as f:
             f.write(template)
-        return f"✅ Created JavaScript file: {filename}\n💡 Template includes modern ES6+ syntax and app structure"
+        return (
+            f"✅ Created JavaScript file: {output_path.name}\n"
+            f"💡 Template includes modern ES6+ syntax and app structure\n"
+            f"📁 Location: {output_path}"
+        )
     except Exception as e:
         return f"❌ Error creating JavaScript file: {str(e)}"
 
@@ -239,9 +302,14 @@ def create_json_file(command):
         }}
     }}
 }}'''
-        with open(filename, 'w', encoding='utf-8') as f:
+        output_path = resolve_output_path(filename)
+        with open(output_path, 'w', encoding='utf-8') as f:
             f.write(template)
-        return f"✅ Created JSON file: {filename}\n💡 Template includes proper JSON structure with metadata"
+        return (
+            f"✅ Created JSON file: {output_path.name}\n"
+            f"💡 Template includes proper JSON structure with metadata\n"
+            f"📁 Location: {output_path}"
+        )
     except Exception as e:
         return f"❌ Error creating JSON file: {str(e)}"
 
@@ -254,11 +322,12 @@ def run_python_script(command):
     if not script_name.endswith('.py'):
         script_name += '.py'
     
-    if not os.path.exists(script_name):
-        return f"❌ Script '{script_name}' not found in current directory"
+    script_path = resolve_access_path(script_name)
+    if not script_path.exists():
+        return f"❌ Script '{script_path.name}' not found in sandbox directory ({get_base_output_dir()})"
     
     try:
-        result = subprocess.run(['python', script_name], 
+        result = subprocess.run(['python', str(script_path)], 
                                capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
             return f"✅ Python script executed successfully:\n{result.stdout}"
@@ -292,9 +361,10 @@ def create_requirements_file():
     try:
         result = subprocess.run(['pip', 'freeze'], capture_output=True, text=True)
         if result.returncode == 0:
-            with open('requirements.txt', 'w') as f:
+            output_path = resolve_output_path('requirements.txt')
+            with open(output_path, 'w') as f:
                 f.write(result.stdout)
-            return "✅ Created requirements.txt with all installed packages"
+            return f"✅ Created requirements.txt with all installed packages\n📁 Location: {output_path}"
         else:
             return "❌ Failed to get installed packages"
     except Exception as e:
@@ -306,11 +376,12 @@ def review_code(command):
     if not filename:
         return "❌ Please specify a file to review. Example: 'review code script.py'"
     
-    if not os.path.exists(filename):
-        return f"❌ File '{filename}' not found"
+    file_path = resolve_access_path(filename)
+    if not file_path.exists():
+        return f"❌ File '{file_path.name}' not found in sandbox directory ({get_base_output_dir()})"
     
     try:
-        with open(filename, 'r', encoding='utf-8') as f:
+        with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
         suggestions = []
@@ -331,9 +402,13 @@ def review_code(command):
             suggestions.append("File appears to be empty")
         
         if suggestions:
-            return f"📝 Code review for {filename}:\n" + "\n".join([f"• {s}" for s in suggestions])
+            return (
+                f"📝 Code review for {file_path.name}:\n"
+                + "\n".join([f"• {s}" for s in suggestions])
+                + f"\n📁 Location: {file_path}"
+            )
         else:
-            return f"✅ Code review for {filename}: No obvious issues found!"
+            return f"✅ Code review for {file_path.name}: No obvious issues found!\n📁 Location: {file_path}"
             
     except Exception as e:
         return f"❌ Error reviewing code: {str(e)}"
@@ -344,16 +419,17 @@ def format_code(command):
     if not filename:
         return "❌ Please specify a file to format. Example: 'format code script.py'"
     
-    if not os.path.exists(filename):
-        return f"❌ File '{filename}' not found"
+    file_path = resolve_access_path(filename)
+    if not file_path.exists():
+        return f"❌ File '{file_path.name}' not found in sandbox directory ({get_base_output_dir()})"
     
     try:
         if filename.endswith('.py'):
             # Try to format Python code
-            result = subprocess.run(['python', '-m', 'autopep8', '--in-place', filename], 
+            result = subprocess.run(['python', '-m', 'autopep8', '--in-place', str(file_path)], 
                                  capture_output=True, text=True)
             if result.returncode == 0:
-                return f"✅ Python code formatted successfully: {filename}"
+                return f"✅ Python code formatted successfully: {file_path.name}\n📁 Location: {file_path}"
             else:
                 return f"❌ Failed to format Python code. Install autopep8: pip install autopep8"
         else:
@@ -388,20 +464,340 @@ def get_coding_help():
 - Use proper file extensions for better IDE support
 - Install packages before running scripts that depend on them"""
 
+
+def _is_file_write_request(command_lower: str) -> bool:
+    """Detect natural phrases requesting file creation + content."""
+    if "file" not in command_lower:
+        return False
+
+    trigger_phrases = (
+        "create a file",
+        "create file",
+        "make a file",
+        "make file",
+        "generate a file",
+        "generate file",
+        "write to file",
+        "write into file",
+        "write in file",
+        "write inside file",
+        "in file",
+        "into file",
+        "add to file",
+        "append to file",
+    )
+    if any(phrase in command_lower for phrase in trigger_phrases):
+        return True
+
+    if re.search(r"\bfile\s+(?:named|called)\s+\S+", command_lower):
+        return True
+
+    if re.search(r"\bcreate\s+(?:a\s+)?[\w\s.-]*file\b", command_lower):
+        return True
+
+    if command_lower.startswith("file "):
+        return True
+
+    return False
+
+
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "for", "with", "about", "on", "of", "to",
+    "in", "into", "by", "from", "write", "create", "make", "generate", "file",
+    "code", "series", "please", "kindly", "bittu", "assistant"
+}
+
+
+def _slugify_hint(text: str, fallback: str = "notes") -> str:
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    filtered = [t for t in tokens if t not in _STOPWORDS]
+    if not filtered:
+        filtered = tokens
+    if not filtered:
+        return fallback
+    return "_".join(filtered[:4])
+
+
+def _infer_extension(command_lower: str, instruction_lower: Optional[str]) -> str:
+    text = instruction_lower or command_lower
+    if any(keyword in text for keyword in ["python", "py ", "function", "script", "fibonacci"]):
+        return ".py"
+    if any(keyword in text for keyword in ["javascript", " js", "node", "frontend"]):
+        return ".js"
+    if "typescript" in text or ".tsx" in text:
+        return ".tsx"
+    if "react" in text or ".jsx" in text:
+        return ".jsx"
+    if "html" in text:
+        return ".html"
+    if "css" in text or "style" in text:
+        return ".css"
+    if "json" in text:
+        return ".json"
+    if "md" in text or "notes" in text or "summary" in text:
+        return ".md"
+    return ".txt"
+
+
+def infer_default_filename(command: str, instruction: Optional[str] = None) -> Optional[str]:
+    """Infer a descriptive filename when the user doesn't specify one."""
+    text_for_slug = instruction or command
+    base = _slugify_hint(text_for_slug, fallback="notes")
+    ext = _infer_extension(command.lower(), instruction.lower() if instruction else None)
+    return f"{base}{ext}"
+
+
+def generate_content_from_instruction(instruction: str, filename: str) -> Optional[str]:
+    """Create smart content snippets for well-known requests."""
+    if not instruction:
+        return None
+    instruction_lower = instruction.lower()
+    extension = Path(filename).suffix.lower()
+    stem = Path(filename).stem
+    
+    if "fibonacci" in instruction_lower:
+        if extension in (".py", ".pyw", "") or "python" in instruction_lower:
+            return _python_fibonacci_template()
+        if extension in (".js", ".jsx", ".ts", ".tsx") or "javascript" in instruction_lower:
+            return _js_fibonacci_template()
+    
+    if (
+        "react" in instruction_lower
+        or "react" in stem.lower()
+        or extension in (".jsx", ".tsx")
+    ):
+        if extension in (".jsx", ".js"):
+            return _react_component_template(stem, is_typescript=False)
+        if extension in (".tsx", ".ts"):
+            return _react_component_template(stem, is_typescript=True)
+        return _react_summary()
+    
+    if "mern" in instruction_lower or "mern" in stem.lower():
+        return _mern_summary()
+    
+    return None
+
+
+def _python_fibonacci_template() -> str:
+    return textwrap.dedent(
+        """\
+        \"\"\"Fibonacci sequence utilities.\"\"\"
+
+        from functools import lru_cache
+
+
+        @lru_cache(maxsize=None)
+        def fibonacci(n: int) -> int:
+            if n < 0:
+                raise ValueError("n must be non-negative")
+            if n in (0, 1):
+                return n
+            return fibonacci(n - 1) + fibonacci(n - 2)
+
+
+        def generate_series(length: int) -> list[int]:
+            return [fibonacci(i) for i in range(length)]
+
+
+        if __name__ == "__main__":
+            series = generate_series(10)
+            print("Fibonacci series:", ", ".join(str(num) for num in series))
+        """
+    ).strip()
+
+
+def _js_fibonacci_template() -> str:
+    return textwrap.dedent(
+        """\
+        // Fibonacci series generator
+        const fibonacci = (n) => {
+          if (n < 0) {
+            throw new Error("n must be non-negative");
+          }
+          if (n <= 1) return n;
+          let prev = 0;
+          let curr = 1;
+          for (let i = 2; i <= n; i += 1) {
+            [prev, curr] = [curr, prev + curr];
+          }
+          return curr;
+        };
+
+        export const generateSeries = (length = 10) =>
+          Array.from({ length }, (_, idx) => fibonacci(idx));
+
+        console.log("Fibonacci series:", generateSeries(10).join(", "));
+        """
+    ).strip()
+
+
+def _react_component_template(stem: str, is_typescript: bool) -> str:
+    component_name = _derive_component_name(stem)
+    if is_typescript:
+        template = textwrap.dedent(
+            """\
+            import { FC, useState } from "react";
+
+            const COMPONENT_NAME: FC = () => {
+              const [count, setCount] = useState(0);
+
+              return (
+                <main className="app-shell">
+                  <header>
+                    <h1>COMPONENT_NAME</h1>
+                    <p>Starter React component generated by Bittu.</p>
+                  </header>
+
+                  <section className="card">
+                    <p>Button clicks: {count}</p>
+                    <button onClick={() => setCount((value) => value + 1)}>
+                      Increment
+                    </button>
+                  </section>
+                </main>
+              );
+            };
+
+            export default COMPONENT_NAME;
+            """
+        ).strip()
+    else:
+        template = textwrap.dedent(
+            """\
+            import { useState } from "react";
+
+            const COMPONENT_NAME = () => {
+              const [count, setCount] = useState(0);
+
+              return (
+                <main className="app-shell">
+                  <header>
+                    <h1>COMPONENT_NAME</h1>
+                    <p>Starter React component generated by Bittu.</p>
+                  </header>
+
+                  <section className="card">
+                    <p>Button clicks: {count}</p>
+                    <button onClick={() => setCount((value) => value + 1)}>
+                      Increment
+                    </button>
+                  </section>
+                </main>
+              );
+            };
+
+            export default COMPONENT_NAME;
+            """
+        ).strip()
+
+    return template.replace("COMPONENT_NAME", component_name)
+
+
+def _react_summary() -> str:
+    return textwrap.dedent(
+        """\
+        # React Overview
+
+        React is an open-source JavaScript library for building user interfaces.
+        Key ideas:
+        • Declarative UI components that react to data changes
+        • A virtual DOM diffing algorithm for fast rendering
+        • One-way data flow that keeps state predictable
+        • Rich ecosystem (hooks, router, context, suspense, server components)
+        • Works with tooling like Vite, Next.js, Remix, Expo, and React Native
+
+        Typical workflow:
+        1. Break the UI into reusable components
+        2. Pass data via props; store shared state with hooks or context
+        3. Compose components to build complete experiences
+        """
+    ).strip()
+
+
+def _mern_summary() -> str:
+    return textwrap.dedent(
+        """\
+        # MERN Stack Cheat Sheet
+
+        **M**ongoDB — Document-oriented database for flexible JSON-like storage.
+        **E**xpress.js — Minimal Node.js framework for building APIs and middleware.
+        **R**eact — Front-end library focused on modular, state-driven UI.
+        **N**ode.js — JavaScript runtime that powers the backend.
+
+        Recommended project structure:
+        /client  → React app (Vite or CRA)
+        /server  → Express app with routes, controllers, services
+        /config  → Environment variables and database connection helpers
+
+        Essential practices:
+        • Use Mongoose models + schemas for validation
+        • Secure APIs with JWT or session cookies
+        • Centralize error handling and logging
+        • Split production builds for client/server and deploy separately
+        """
+    ).strip()
+
+
+def _derive_component_name(stem: str) -> str:
+    candidate = re.sub(r"[^0-9a-zA-Z]+", " ", stem).title().replace(" ", "")
+    return candidate or "GeneratedComponent"
+
 def extract_filename_from_command(command):
-    """Extract filename from command"""
+    """Extract filename from command (preserves original casing)."""
     patterns = [
-        r'create \w+ file (\S+)',
-        r'create \w+ (\S+)',
-        r'run python (\S+)',
-        r'execute python (\S+)',
-        r'review code (\S+)',
-        r'format code (\S+)',
+        r'create\s+(?:a\s+)?file\s+(?:named\s+|called\s+)?([^\s]+)',
+        r'create\s+\w+\s+file\s+(?:named\s+|called\s+)?([^\s]+)',
+        r'create\s+\w+\s+(?:named\s+|called\s+)?([^\s]+)',
+        r'in\s+file\s+(?:named\s+|called\s+)?([^\s]+)',
+        r'write\s+to\s+file\s+(?:named\s+|called\s+)?([^\s]+)',
+        r'write\s+into\s+file\s+(?:named\s+|called\s+)?([^\s]+)',
+        r'file\s+(?:named\s+|called\s+)?([^\s]+)\s+with',
+        r'run\s+python\s+([^\s]+)',
+        r'execute\s+python\s+([^\s]+)',
+        r'review\s+code\s+([^\s]+)',
+        r'format\s+code\s+([^\s]+)',
     ]
     for pattern in patterns:
-        match = re.search(pattern, command.lower())
+        match = re.search(pattern, command, flags=re.IGNORECASE)
         if match:
             return match.group(1)
+    
+    tokens = command.split()
+    for i, token in enumerate(tokens[:-1]):
+        if token.lower() == "file":
+            return tokens[i + 1]
+    
+    return None
+
+def extract_file_content(command):
+    """Extract inline content specified via 'with content ...'"""
+    command_lower = command.lower()
+    markers = [
+        "with content",
+        "with text",
+        "containing",
+        "content",
+        "text",
+        "write about",
+        "and write about",
+        "and write",
+        "write in",
+        "write into",
+        "write to",
+        "write",
+    ]
+    for marker in markers:
+        idx = command_lower.find(marker)
+        if idx != -1:
+            content = command[idx + len(marker):].strip(" :\"'`")
+            if not content:
+                continue
+            # Remove trailing phrases like "in that file" or "into that file"
+            content = re.sub(r'\s+(?:in|into|to)\s+(?:that\s+)?file.*$', '', content, flags=re.IGNORECASE)
+            # Remove leading filler words
+            content = re.sub(r'^(?:about|text|content)\s+', '', content, flags=re.IGNORECASE)
+            if content:
+                return content
     return None
 
 def extract_package_name(command):
