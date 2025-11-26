@@ -39,6 +39,9 @@ def main():
             "VOICE_WAKE_REPEAT_PROMPT",
             "I didn't catch that. Please tell me your request."
         )
+        require_wake_word = os.getenv("VOICE_REQUIRE_WAKE_WORD", "1") != "0"
+        auto_listen_after_command = os.getenv("VOICE_AUTO_LISTEN_AFTER_COMMAND", "1") != "0"
+        voice_ready_prompt = os.getenv("VOICE_READY_PROMPT", "Waiting for your next command.")
         pending_wake_timeout = float(os.getenv("VOICE_PENDING_TIMEOUT", "4.0"))
         pending_wake_started_at: float | None = None
         pending_wake_prompted = False
@@ -96,11 +99,15 @@ def main():
 
         def _start_voice_task(command: str) -> None:
             nonlocal pending_youtube_song, pending_command_buffer, voice_enabled
+            nonlocal pending_wake_command, pending_wake_started_at, pending_wake_prompted
+            nonlocal auto_listen_after_command, voice_ready_prompt
             print(f"🚀 _start_voice_task called with: '{command}'")
             cancel_event = threading.Event()
 
             def worker() -> None:
                 nonlocal pending_youtube_song, pending_command_buffer, voice_enabled
+                nonlocal pending_wake_command, pending_wake_started_at, pending_wake_prompted
+                nonlocal voice_ready_prompt, auto_listen_after_command
                 start_time = time.time()
                 try:
                     try:
@@ -145,6 +152,10 @@ def main():
                         speak_if_allowed(voice_response)
                     pending_command_buffer = ""
                     announce_ready(command, resp)
+                    if auto_listen_after_command:
+                        pending_wake_command = True
+                        pending_wake_started_at = time.time()
+                        pending_wake_prompted = False
                     total_elapsed = time.time() - start_time
                     print(f"✅ Command completed in {total_elapsed:.2f}s. 🎤 Listening for 'bittu'...")
                     if voice_enabled and voice_engine and not voice_engine.is_running():
@@ -501,9 +512,8 @@ def main():
             return False
 
         def announce_ready(command_or_text: str, full_response: str | None = None) -> None:
-            """After completing a command, set state/UI to indicate ready for next command.
-            Don't speak - just update UI to avoid TTS interfering with continuous listening.
-            """
+            """Signal that the assistant is ready for the next command and optionally speak a prompt."""
+            nonlocal voice_ready_prompt, voice_engine, voice_tts_enabled
             try:
                 from interface.web_server import emit_log as _emit_log
             except Exception:
@@ -514,6 +524,20 @@ def main():
             except Exception:
                 pass
             _emit_log("Status: listening for wake word 'bittu'")
+            if (
+                voice_ready_prompt
+                and voice_tts_enabled
+                and voice_engine
+                and voice_engine.is_running()
+            ):
+                try:
+                    print(f"🔊 Speaking ready prompt: '{voice_ready_prompt}'")
+                    speak_if_allowed(voice_ready_prompt)
+                    print(f"✅ Ready prompt spoken successfully")
+                except Exception as e:
+                    print(f"⚠️ Failed to speak ready prompt: {e}")
+                    import traceback
+                    traceback.print_exc()
 
         # Create voice_engine variable placeholder (will be set before use)
         voice_engine = None
@@ -527,9 +551,13 @@ def main():
             nonlocal pending_wake_started_at
             nonlocal pending_wake_prompted
             nonlocal voice_tts_enabled
+            nonlocal require_wake_word
             """Handle voice input - simplified Alexa-like behavior: always listen for wake word."""
             # Reduced logging for faster processing
             print(f"\n🎤 Voice input: '{text}'")
+            print(f"🔍 on_voice_text called, pending_wake_command={pending_wake_command}")
+            import sys
+            sys.stdout.flush()
             try:
                 if not text or not text.strip():
                     print("⚠️ Empty text received, ignoring...")
@@ -552,7 +580,14 @@ def main():
                     print("🔊 Voice responses re-enabled.")
                     return
 
-                if pending_wake_command and pending_wake_started_at and pending_wake_timeout > 0:
+                # Check timeout ONLY if text doesn't look like a command
+                # If text looks like a command, process it immediately
+                text_looks_like_command = any(
+                    text.lower().strip().startswith(cmd) 
+                    for cmd in ["open ", "start ", "launch ", "create ", "set ", "play ", "what ", "who ", "how ", "where "]
+                ) or any(keyword in text.lower() for keyword in ["youtube", "google", "facebook", "weather", "reminder", "notepad"])
+                
+                if pending_wake_command and pending_wake_started_at and pending_wake_timeout > 0 and not text_looks_like_command:
                     elapsed = time.time() - pending_wake_started_at
                     if elapsed >= pending_wake_timeout and not pending_wake_prompted:
                         pending_wake_prompted = True
@@ -563,6 +598,8 @@ def main():
                             except Exception:
                                 pass
                         pending_wake_started_at = time.time()
+                elif text_looks_like_command and pending_wake_command:
+                    print(f"✅ Command-like text detected, processing immediately (pending_wake_command=True)")
                     
                 print(f"🎤 Processing voice input: '{text}'")
                 try:
@@ -584,38 +621,185 @@ def main():
 
                 # Enhanced wake word detection with confidence (Siri/Alexa-like accuracy)
                 print(f"🔍 Step 1: Checking wake word in text: '{text}'")
-                if pending_wake_command:
-                    wake_present = True
-                    wake_confidence = "pending"
-                    print("🔔 Wake word pending - expecting command without repeating 'Bittu'.")
-                    pending_wake_command = False
-                else:
-                    wake_present = voice_engine.using_wake_detector or has_wake_word(text)
-                    wake_confidence = "high" if voice_engine.using_wake_detector else ("high" if has_wake_word(text) else "none")
-                print(f"🔍 Wake word detected: {wake_present} (confidence: {wake_confidence})")
+                import sys
+                sys.stdout.flush()
+                # Track if this is a pending wake command - these MUST be processed
+                was_pending_wake = pending_wake_command
+                try:
+                    if pending_wake_command:
+                        # If pending_wake_command is True, we're expecting a command
+                        # The text might contain "Bittu" or not - either way, process it
+                        wake_present = True
+                        wake_confidence = "pending"
+                        print("🔔 Wake word pending - expecting command (may or may not include 'Bittu').")
+                        pending_wake_command = False
+                        print(f"🔍 Set wake_present=True, pending_wake_command=False (was_pending={was_pending_wake})")
+                        print(f"🔍 Text received: '{text}' - will process as command")
+                        sys.stdout.flush()
+                    else:
+                        wake_present = voice_engine.using_wake_detector or has_wake_word(text)
+                        wake_confidence = "high" if voice_engine.using_wake_detector else ("high" if has_wake_word(text) else "none")
+                    print(f"🔍 Wake word detected: {wake_present} (confidence: {wake_confidence})")
+                    print(f"🔍 About to proceed to Step 2...")
+                    sys.stdout.flush()
+                except Exception as step1_err:
+                    print(f"❌ ERROR in Step 1: {step1_err}")
+                    import traceback
+                    traceback.print_exc()
+                    # Set defaults and continue - especially for pending wake commands
+                    wake_present = was_pending_wake if was_pending_wake else False
+                    wake_confidence = "error"
+                    print(f"🔍 After Step 1 error: wake_present={wake_present}, was_pending_wake={was_pending_wake}")
+                    print(f"🔍 About to proceed to Step 2 (after error recovery)...")
+                    sys.stdout.flush()
+                finally:
+                    # Ensure we always proceed to Step 2, especially for pending wake commands
+                    if was_pending_wake:
+                        print(f"✅ Step 1 complete for pending wake command, ensuring continuation...")
+                        sys.stdout.flush()
 
                 # Check if previous task is running (non-blocking check)
-                print(f"🔍 Step 2: Checking if previous task is running...")
+                # CRITICAL: This must always execute, especially for pending wake commands
+                print(f"🔍 Step 2: Checking if previous task is running... (was_pending_wake={was_pending_wake})")
+                import sys
+                sys.stdout.flush()
+                task_running = False
+                is_speaking = False
                 try:
                     task_running = _is_voice_task_running()
                     is_speaking = bool(
                         voice_engine and hasattr(voice_engine, "is_speaking") and voice_engine.is_speaking()
                     )
-                    print(f"🔍 Step 2 result: task_running={task_running}, is_speaking={is_speaking}")
-                    if wake_present and task_running:
+                    print(f"🔍 Step 2 result: task_running={task_running}, is_speaking={is_speaking}, was_pending_wake={was_pending_wake}")
+                    
+                    # For pending wake commands, skip TTS checks and proceed immediately
+                    # CRITICAL: Pending wake commands must always process, regardless of TTS state
+                    if was_pending_wake and not task_running:
+                        # Pending wake command - request TTS stop in background, don't wait
+                        if is_speaking:
+                            print("🎧 Pending wake command: TTS is speaking, will stop in background...")
+                            sys.stdout.flush()
+                            # Stop TTS in a separate thread to avoid blocking
+                            def stop_tts_async():
+                                try:
+                                    if voice_engine and hasattr(voice_engine, "stop_speaking"):
+                                        voice_engine.stop_speaking()
+                                except:
+                                    pass
+                            threading.Thread(target=stop_tts_async, daemon=True).start()
+                        print(f"✅ Pending wake command: Proceeding immediately (TTS stop requested in background)")
+                        sys.stdout.flush()
+                        # Continue immediately - don't wait for TTS to stop
+                    elif wake_present and task_running:
                         print("⏳ Still working on the previous task. Incoming command will be queued once ready.")
-                    if wake_present and is_speaking and not task_running:
-                        print("🎧 Wake word detected while TTS is speaking. Stopping speech to listen.")
+                    elif wake_present and is_speaking and not task_running:
+                        if was_pending_wake:
+                            print("🎧 Pending wake command detected while TTS is speaking. FORCING TTS stop and immediate processing...")
+                        else:
+                            print("🎧 Wake word detected while TTS is speaking. Stopping TTS immediately...")
+                        import sys
+                        import time as _t
+                        sys.stdout.flush()
+                        # Aggressively stop TTS - this is critical for continuous listening
+                        # For pending wake commands, be even more aggressive
                         try:
-                            voice_engine.stop_speaking()
-                        except Exception:
-                            pass
+                            if voice_engine:
+                                # Try multiple methods to ensure TTS stops
+                                if hasattr(voice_engine, "stop_speaking"):
+                                    voice_engine.stop_speaking()
+                                    print(f"🔍 TTS stop_speaking() called")
+                                if hasattr(voice_engine, "stop"):
+                                    try:
+                                        voice_engine.stop()
+                                        print(f"🔍 TTS stop() called")
+                                    except:
+                                        pass
+                                # For pending wake commands, use shorter delay
+                                delay = 0.05 if was_pending_wake else 0.1
+                                _t.sleep(delay)
+                                # Verify TTS stopped (but don't block if it didn't)
+                                try:
+                                    is_still_speaking = bool(
+                                        voice_engine and hasattr(voice_engine, "is_speaking") and voice_engine.is_speaking()
+                                    )
+                                    if is_still_speaking:
+                                        print(f"⚠️ TTS still speaking after stop attempt, continuing anyway (pending_wake={was_pending_wake})")
+                                    else:
+                                        print(f"✅ TTS stopped successfully")
+                                except:
+                                    print(f"⚠️ Could not verify TTS state, continuing anyway")
+                        except Exception as e:
+                            print(f"⚠️ Error stopping TTS: {e}")
+                            import traceback
+                            traceback.print_exc()
+                        finally:
+                            # ALWAYS continue - never let TTS block command processing
+                            # Especially for pending wake commands
+                            if was_pending_wake:
+                                print(f"✅ FORCING command processing (pending wake command, TTS handled)")
+                            else:
+                                print(f"✅ Proceeding with command processing (TTS stop attempted)")
+                            sys.stdout.flush()
+                            # CRITICAL: Mark that we've handled TTS, so processing can continue
+                            print(f"✅ TTS handling complete, proceeding to continuation point...")
+                            sys.stdout.flush()
                 except Exception as check_err:
                     print(f"⚠️ Error checking task status: {check_err}")
-                    # Continue anyway
+                    import traceback
+                    traceback.print_exc()
+                    import sys
+                    sys.stdout.flush()
+                    # Continue anyway - don't let errors block command processing
+                    # For pending wake commands, we MUST continue
+                    if was_pending_wake:
+                        print(f"✅ FORCING continuation despite Step 2 error (pending wake)")
+                        sys.stdout.flush()
 
-                # Enhanced command detection with better intent recognition
-                print(f"🔍 Step 3: Analyzing command intent...")
+                # ALWAYS continue processing command after checking task status
+                # This is CRITICAL - must execute for all commands, especially pending wake
+                print(f"✅ Step 2 complete, proceeding to continuation (was_pending_wake={was_pending_wake})")
+                import sys
+                sys.stdout.flush()
+                # This should ALWAYS execute - if it doesn't, there's a bug
+                # CRITICAL: For pending wake commands, we MUST continue
+                try:
+                    print(f"✅ About to reach continuation point (was_pending_wake={was_pending_wake})...")
+                    import sys
+                    sys.stdout.flush()
+                    
+                    # FORCE continuation for pending wake commands - no exceptions
+                    if was_pending_wake:
+                        print(f"✅ FORCED continuation point after Step 2 (pending wake command - MUST process)")
+                        print(f"🔄 FORCING command processing (pending wake, ignoring TTS state)...")
+                        print(f"🔄 Text being processed: '{text}', wake_present={wake_present}, was_pending_wake={was_pending_wake}")
+                        sys.stdout.flush()
+                    else:
+                        print(f"✅ Reached continuation point after Step 2")
+                        print(f"🔄 Continuing command processing after TTS stop...")
+                        print(f"🔄 Text being processed: '{text}', wake_present={wake_present}, was_pending_wake={was_pending_wake}")
+                        sys.stdout.flush()
+                    
+                    # Enhanced command detection with better intent recognition
+                    print(f"🔍 Step 3: Analyzing command intent...")
+                    sys.stdout.flush()
+                except Exception as cont_err:
+                    print(f"❌ ERROR in continuation block: {cont_err}")
+                    import traceback
+                    traceback.print_exc()
+                    # Even on error, continue if it was a pending wake
+                    if was_pending_wake:
+                        print(f"🔄 FORCING continuation despite error (pending wake)")
+                        sys.stdout.flush()
+                    else:
+                        print(f"🔄 Continuing despite error")
+                        sys.stdout.flush()
+                
+                # CRITICAL: Ensure we always reach Step 3, especially for pending wake commands
+                if was_pending_wake:
+                    print(f"🔍 FORCING Step 3 execution (pending wake command)")
+                    import sys
+                    sys.stdout.flush()
+                
                 is_command_like = False
                 command_confidence = 0.0
                 try:
@@ -667,19 +851,51 @@ def main():
                     traceback.print_exc()
 
                 # Process if wake word detected OR phrase looks like a command (with confidence threshold)
-                should_process = wake_present or (is_command_like and command_confidence >= 0.6)
-                print(f"🔍 Step 4: should_process={should_process} (wake_present={wake_present}, is_command_like={is_command_like}, confidence={command_confidence})")
+                # CRITICAL: If this was a pending wake command, we MUST process it - no exceptions
+                if was_pending_wake:
+                    should_process = True
+                    # Force command_like and confidence for pending wake commands
+                    if not is_command_like:
+                        is_command_like = True
+                        command_confidence = 0.9
+                        print(f"🔍 Step 4: FORCING is_command_like=True for pending wake command")
+                    print(f"🔍 Step 4: FORCING should_process=True (was_pending_wake=True)")
+                    import sys
+                    sys.stdout.flush()
+                elif require_wake_word:
+                    should_process = wake_present
+                else:
+                    should_process = wake_present or (is_command_like and command_confidence >= 0.6)
+                print(
+                    f"🔍 Step 4: should_process={should_process} "
+                    f"(was_pending_wake={was_pending_wake}, require_wake_word={require_wake_word}, wake_present={wake_present}, "
+                    f"is_command_like={is_command_like}, confidence={command_confidence})"
+                )
+                import sys
+                sys.stdout.flush()
                 
                 if should_process:
                     print(f"🔍 Step 5: Entering command processing block...")
+                    print(f"🔍 Command will be processed: wake_present={wake_present}, is_command_like={is_command_like}")
                     try:
                         # Remove wake word and get the command (or use full text for command-like)
                         if voice_engine.using_wake_detector:
                             command = text.strip()
                             print(f"🔍 Using wake detector mode, command: '{command}'")
                         else:
-                            command = strip_wake_word(text) if wake_present else text
-                            print(f"🔍 Stripped wake word, command: '{command}'")
+                            # Strip wake word if present, otherwise use text as-is
+                            if wake_present:
+                                # If text contains wake word, strip it; otherwise use text as command
+                                if has_wake_word(text):
+                                    command = strip_wake_word(text)
+                                    print(f"🔍 Stripped wake word, command: '{command}'")
+                                else:
+                                    # Wake was pending, text is the command itself
+                                    command = text.strip()
+                                    print(f"🔍 Using text as command (wake was pending), command: '{command}'")
+                            else:
+                                command = text.strip()
+                                print(f"🔍 Using text as command (no wake word), command: '{command}'")
                         
                         # Normalize common typos and variations
                         command = normalize_command_typos(command)
@@ -697,11 +913,19 @@ def main():
                             
                             # Quick check: if command is clearly complete (has action + target), process immediately
                             # This prevents false positives on "incomplete" commands
+                            # BUT: For pending wake commands, always process (user already said the command)
                             action_words = ["open", "start", "launch", "create", "write", "play", "set", "run", "execute"]
                             has_action = any(cmd_lower_for_followup.startswith(act + " ") or cmd_lower_for_followup == act for act in action_words)
-                            print(f"🔍 Command analysis: has_action={has_action}, cmd='{cmd_lower_for_followup}'")
+                            print(f"🔍 Command analysis: has_action={has_action}, cmd='{cmd_lower_for_followup}', was_pending_wake={was_pending_wake}")
                             
-                            if not has_action and command_needs_followup(cmd_lower_for_followup):
+                            # Skip incomplete check for pending wake commands - user already said the command
+                            # For pending wake commands, ALWAYS process regardless of action words
+                            if was_pending_wake:
+                                print(f"✅ Processing pending wake command (skipping all checks, user already said command)")
+                                # Force has_action to True for pending wake commands so they always process
+                                has_action = True
+                                print(f"✅ Forced has_action=True for pending wake command")
+                            elif not has_action and command_needs_followup(cmd_lower_for_followup):
                                 pending_wake_command = True
                                 pending_command_buffer = command.strip()
                                 pending_wake_started_at = time.time()
@@ -713,16 +937,44 @@ def main():
                                     pass
                                 return
 
-                            if _is_voice_task_running():
+                            # For pending wake commands, if only TTS is speaking (not a real task), process immediately
+                            # Otherwise, queue if a real task is running
+                            task_running_check = _is_voice_task_running()
+                            is_speaking_check = bool(
+                                voice_engine and hasattr(voice_engine, "is_speaking") and voice_engine.is_speaking()
+                            )
+                            
+                            if task_running_check:
+                                # Real task is running - queue the command
                                 with command_queue_lock:
                                     command_queue.append(command.strip())
-                                print(f"📥 Command queued while busy: '{command.strip()}'")
+                                print(f"📥 Command queued while task running: '{command.strip()}'")
                                 speak_if_allowed("I'm finishing your previous request. I'll handle that next.")
                                 return
+                            elif was_pending_wake and is_speaking_check and not task_running_check:
+                                # Pending wake command + only TTS speaking (no real task) = process immediately
+                                print(f"✅ Processing pending wake command immediately (TTS only, no real task)")
+                                print(f"✅ Bypassing queue, processing command now...")
+                                import sys
+                                sys.stdout.flush()
+                                # Continue to process the command below
+                            elif is_speaking_check:
+                                # TTS is speaking but it's not a pending wake command - still process (TTS will be stopped)
+                                print(f"✅ Processing command (TTS will be interrupted)")
+                                # Continue to process the command below
 
+                            # This should ALWAYS execute if we reach here
                             command_to_run = command.strip()
-                            print(f"🎯 Processing command: '{command_to_run}'")
+                            print(f"🎯 Processing command: '{command_to_run}' (was_pending_wake={was_pending_wake})")
                             print(f"⚡ Starting task execution immediately...")
+                            import sys
+                            sys.stdout.flush()
+                            # Set pending_wake_command immediately so next command doesn't need "Bittu"
+                            if auto_listen_after_command:
+                                pending_wake_command = True
+                                pending_wake_started_at = time.time()
+                                pending_wake_prompted = False
+                                print(f"🔔 Auto-listen enabled: next command won't need 'Bittu'")
                             try:
                                 _start_voice_task(command_to_run)
                                 print(f"✅ _start_voice_task called successfully for '{command_to_run}'")
